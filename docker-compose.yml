@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  ical-service:
+    build: .
+    container_name: sustech-ical-service
+    env_file:
+      - .env
+    # 不再需要将端口暴露给主机，因为它只和 Caddy 通信
+    # ports:
+    #   - "5001:5001"
+    volumes:
+      # 将本地的 cache 目录挂载到容器的 /app 目录
+      # 注意：这里我们将缓存文件保存在一个专门的目录中
+      - ./cache:/app/cache
+    restart: unless-stopped
+
+  caddy:
+    # 使用官方的 Caddy 镜像
+    image: caddy:2-alpine
+    container_name: caddy-proxy
+    restart: unless-stopped
+    ports:
+      # 暴露 HTTP 和 HTTPS 端口
+      - "80:80"
+      - "443:443"
+    volumes:
+      # 挂载 Caddyfile 作为配置文件
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      # 创建一个持久化卷来存储 Caddy 的数据（如 SSL 证书）
+      - caddy_data:/data
+      # 创建一个持久化卷来存储 Caddy 的配置状态
+      - caddy_config:/config
+
+# 定义持久化卷
+volumes:
+  caddy_data:
+  caddy_config:
+  cache: # 确保 cache 卷被定义

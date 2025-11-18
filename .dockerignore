@@ -1,0 +1,13 @@
+# 忽略 Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 忽略 Git 目录
+.git/
+
+# 忽略 VS Code 设置
+.vscode/
+
+# 忽略本地缓存的日历文件
+cached_schedule.ics
