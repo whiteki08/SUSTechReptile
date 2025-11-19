@@ -75,10 +75,39 @@ def convert_json_to_ical(schedule_json):
 
             e = Event()
             e.name = item.get('KCMC', '未命名事件')
+            filter = os.getenv('FILTER')
+            flag = True
+            for keyword in (filter or []):
+                if keyword in e.name:
+                    # 跳过包含过滤关键词的课程
+                    flag = False
+                    break
+            if not flag:
+                continue
+
             # 使用 shanghai_tz.localize 将 naive datetime 转换为带时区的 "aware" datetime
             e.begin = shanghai_tz.localize(naive_begin)
             e.end = shanghai_tz.localize(naive_end)
-            e.location = item.get('NR', '无地点信息')
+            location_str = item.get('NR')
+            if location_str:  # 检查 location_str 是否为 None 或空字符串
+                prefix = os.getenv('LOCATION_PREFIX')
+                replace_dict = {
+                    '一教': '第一教学楼',
+                    '二教': '第二教学楼',
+                    '三教': '第三教学楼',
+                    '智华': '第三教学楼'}  # 在地图更新前，先用第三教学楼代替智华楼
+                # 替换地点中的简写
+                for short, full in replace_dict.items():
+                    if short in location_str:
+                        location_str = location_str.replace(short, full)
+                        print(
+                            f"Replaced '{short}' with '{full}'. New location: {location_str}")
+                        break
+
+                if prefix:
+                    e.location = prefix + location_str
+                else:
+                    e.location = location_str
 
             # -- 修复BUG --
             # 使用更可靠的正则表达式来提取教师姓名
