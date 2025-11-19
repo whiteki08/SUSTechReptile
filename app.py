@@ -64,7 +64,17 @@ def convert_tis_json_to_ical(schedule_json):
                 f"{item['SJ']} {end_time_str}:00", '%Y-%m-%d %H:%M:%S')
 
             e = Event()
-            e.name = item.get('KCMC', '未命名事件')
+            e.name = item.get('KCMC')
+            # 应用过滤器
+            filter = os.getenv('COURSE_NAME_FILTER')
+            flag = True
+            if filter:
+                for keyword in json.loads(filter):
+                    if keyword in e.name:
+                        flag = False
+                        break
+            if not flag:
+                continue
             e.begin = SHANGHAI_TZ.localize(naive_begin)
             e.end = SHANGHAI_TZ.localize(naive_end)
 
