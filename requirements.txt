@@ -2,3 +2,4 @@ flask
 ics
 pytz
 requests
+lxml
