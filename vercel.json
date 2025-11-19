@@ -16,7 +16,7 @@
   "crons": [
     {
       "path": "/api/cron/fetch?source=all&cron_token=${CRON_TOKEN}",
-      "schedule": "0 */12 * * *"
+      "schedule": "0 */13 * * *"
     }
   ]
 }
