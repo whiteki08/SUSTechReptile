@@ -3,3 +3,4 @@ ics
 pytz
 requests
 lxml
+vercel-kv

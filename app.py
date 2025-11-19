@@ -3,101 +3,84 @@ import json
 from datetime import datetime, timedelta
 from flask import Flask, Response, request, abort
 from tisService import TisService
-from bbService import bbService  # 导入 bbService
+from bbService import bbService
 from ics import Calendar, Event
 import pytz
 import re
+from vercel_kv import kv  # 导入 Vercel KV 客户端
 
 # --- 配置 ---
+# 这些将从 Vercel 的环境变量中读取
 SUSTECH_SID = os.environ.get('SUSTECH_SID')
 SUSTECH_PASSWORD = os.environ.get('SUSTECH_PASSWORD')
 ICAL_TOKEN = os.environ.get('ICAL_TOKEN')
+CRON_TOKEN = os.environ.get('CRON_TOKEN')  # Cron Job 的安全令牌
 
 # --- 通用配置 ---
-CACHE_DIR = "cache"
 SCHEDULE_FETCH_RANGE_DAYS = 120
 SCHEDULE_PAST_DAYS = 30
 SHANGHAI_TZ = pytz.timezone("Asia/Shanghai")
 
 # --- TIS 特定配置 ---
-TIS_CACHE_FILE = os.path.join(CACHE_DIR, "tis_schedule.ics")
-TIS_CACHE_EXPIRY_DAYS = 7  # 课表每周更新一次
+TIS_CACHE_KEY = "tis_schedule_ics"  # Vercel KV 中的键名
 CLASS_TIME_MAP = {
-    1: ("08:00", "09:50"),
-    3: ("10:20", "12:10"),
-    5: ("14:00", "15:50"),
-    7: ("16:20", "18:10"),
-    9: ("19:00", "20:50"),
-    11: ("21:00", "21:50"),
+    1: ("08:00", "09:50"), 3: ("10:20", "12:10"), 5: ("14:00", "15:50"),
+    7: ("16:20", "18:10"), 9: ("19:00", "20:50"), 11: ("21:00", "21:50"),
 }
 
 # --- Blackboard 特定配置 ---
-BB_CACHE_FILE = os.path.join(CACHE_DIR, "bb_schedule.ics")
-BB_CACHE_EXPIRY_DAYS = 1  # 作业DDL每天更新一次可能更合适
+BB_CACHE_KEY = "bb_schedule_ics"  # Vercel KV 中的键名
 
 app = Flask(__name__)
 
+# =================================================================
+# 数据转换函数 (与之前基本相同)
+# =================================================================
 
-# =================================================================
-# TIS (课表) 相关函数
-# =================================================================
 
 def convert_tis_json_to_ical(schedule_json):
     """将从 TIS 获取的课表 JSON 转换为 iCalendar 格式字符串"""
     cal = Calendar()
     data = json.loads(schedule_json) if isinstance(
         schedule_json, str) else schedule_json
-
     for date_str, events in data.items():
         for item in (events or []):
-            if not item.get('KSJC'):
+            if not item.get('KSJC') or not item.get('KCMC'):
                 continue
-
             start_time_str, end_time_str = CLASS_TIME_MAP.get(
                 item['KSJC'], (None, None))
             if not start_time_str:
                 continue
-
             naive_begin = datetime.strptime(
                 f"{item['SJ']} {start_time_str}:00", '%Y-%m-%d %H:%M:%S')
             naive_end = datetime.strptime(
                 f"{item['SJ']} {end_time_str}:00", '%Y-%m-%d %H:%M:%S')
-
             e = Event()
             e.name = item.get('KCMC')
-            # 应用过滤器
             filter = os.getenv('COURSE_NAME_FILTER')
+            # filter is a array
             flag = True
             if filter:
-                for keyword in json.loads(filter):
+                filter_list = json.loads(filter)
+                flag = False
+                for keyword in filter_list:
                     if keyword in e.name:
-                        flag = False
+                        flag = True
                         break
             if not flag:
                 continue
             e.begin = SHANGHAI_TZ.localize(naive_begin)
             e.end = SHANGHAI_TZ.localize(naive_end)
-
-            # 保留先前对 TIS 地点的处理逻辑
             location_str = item.get('NR')
             if location_str:
                 prefix = os.getenv('LOCATION_PREFIX')
-                replace_dict = {
-                    '一教': '第一教学楼',
-                    '二教': '第二教学楼',
-                    '三教': '第三教学楼',
-                    '智华': '第三教学楼'}
+                replace_dict = {'一教': '第一教学楼', '二教': '第二教学楼',
+                                '三教': '第三教学楼', '智华': '第三教学楼'}
                 for short, full in replace_dict.items():
                     if short in location_str:
                         location_str = location_str.replace(short, full)
-                        print(
-                            f"Replaced '{short}' with '{full}'. New location: {location_str}")
                         break
-                if prefix:
-                    e.location = prefix + location_str
-                else:
-                    e.location = location_str
-
+                e.location = (prefix or '') + location_str
             teacher_name = 'N/A'
             bt_string = item.get('BT', '')
             if ':' in bt_string:
@@ -105,155 +88,131 @@ def convert_tis_json_to_ical(schedule_json):
                 if match:
                     teacher_name = match.group(1)
             e.description = f"教师: {teacher_name}\n课程标题: {bt_string}"
-
             cal.events.add(e)
     return str(cal)
 
-
-def fetch_and_cache_tis_schedule():
-    """抓取 TIS 课表并更新缓存"""
-    print("Fetching new schedule from TIS...")
-    service = TisService()
-    if not service.Login():
-        raise ConnectionError("TIS CAS Login Failed.")
-    service.LoginTIS()
-
-    today = datetime.now()
-    start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
-    end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
-    schedule_data = service.queryScheduleInterval(
-        start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-
-    ical_data = convert_tis_json_to_ical(schedule_data)
-    with open(TIS_CACHE_FILE, "w", encoding="utf-8") as f:
-        f.write(ical_data)
-    print(f"TIS cache updated successfully in '{TIS_CACHE_FILE}'.")
-    return ical_data
-
-
-# =================================================================
-# Blackboard (DDL) 相关函数
-# =================================================================
 
 def convert_bb_json_to_ical(events_json):
     """将从 Blackboard 获取的日历事件 JSON 转换为 iCalendar 格式字符串"""
     cal = Calendar()
     for item in (events_json or []):
         e = Event()
-        if not item.get('title') or not item.get('startDate') or not item.get('endDate') or not item.get('calendarName'):
-            continue
-        course_name = item.get('calendarName')
-        event_title = item.get('title')
-        event_type = item.get('eventType')
-
-        # 为截止日期类型的事件添加明确的前缀
-        if event_type == 'Assignment' or event_type == '作业':
-
-            e.name = f"「{course_name}」 {event_title}"
-        else:
-            e.name = f"[{course_name}] {event_title}"
-
+        course_name = item.get('calendarName', 'Unknown Course')
+        event_title = item.get('title', '未命名事件')
+        event_type = item.get('eventType', 'Event')
+        e.name = f"「{course_name}」 {event_title}" if event_type in [
+            'Assignment', '作业'] else f"[{course_name}] {event_title}"
         try:
-            # 使用 startDate 和 endDate，它们是带有时区信息的 UTC 时间
-            start_str = item['startDate']
-            end_str = item['endDate']
-
-            # Python 3.11+ 的 fromisoformat 可以直接处理 'Z'
-            # 为了更好的兼容性，我们手动替换 'Z'
-            if start_str.endswith('Z'):
-                start_str = start_str[:-1] + '+00:00'
-            if end_str.endswith('Z'):
-                end_str = end_str[:-1] + '+00:00'
-
-            # 解析为带时区的 datetime 对象
+            start_str = item['startDate'][:-1] + \
+                '+00:00' if item['startDate'].endswith(
+                    'Z') else item['startDate']
+            end_str = item['endDate'][:-1] + \
+                '+00:00' if item['endDate'].endswith('Z') else item['endDate']
             e.begin = datetime.fromisoformat(start_str)
             e.end = datetime.fromisoformat(end_str)
-
-            # 保持截止日期为零时长事件，这是最准确的表示方法
-            # 不再人为增加时长
-
-        except (KeyError, ValueError) as err:
-            print(
-                f"Skipping event due to invalid time format: {event_title}, Error: {err}")
+        except (KeyError, ValueError):
             continue
-
-        # 将课程名和事件类型放入描述中
         e.description = f"Course: {course_name}\nDescription: Deadline from Blackboard"
-        # BB 日历不需要地点信息
         cal.events.add(e)
     return str(cal)
 
+# =================================================================
+# 数据抓取与缓存函数 (修改为写入 Vercel KV)
+# =================================================================
+
+
+def fetch_and_cache_tis_schedule():
+    """抓取 TIS 课表并更新到 Vercel KV"""
+    print("Fetching new schedule from TIS...")
+    service = TisService()
+    if not service.Login():
+        raise ConnectionError("TIS CAS Login Failed.")
+    service.LoginTIS()
+    today = datetime.now()
+    start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
+    end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
+    schedule_data = service.queryScheduleInterval(
+        start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
+    ical_data = convert_tis_json_to_ical(schedule_data)
+    kv.set(TIS_CACHE_KEY, ical_data)
+    print(f"TIS cache updated successfully in Vercel KV.")
+    return ical_data
+
 
 def fetch_and_cache_bb_schedule():
-    """抓取 Blackboard 日历事件并更新缓存"""
+    """抓取 Blackboard 日历事件并更新到 Vercel KV"""
     print("Fetching new schedule from Blackboard...")
     service = bbService()
     if not service.Login():
         raise ConnectionError("BB CAS Login Failed.")
     if not service.LoginBB():
         raise ConnectionError("BB Login Failed.")
-
     today = datetime.now()
     start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
     end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
     schedule_data = service.queryCalendar(start_date, end_date)
-
     ical_data = convert_bb_json_to_ical(schedule_data)
-    with open(BB_CACHE_FILE, "w", encoding="utf-8") as f:
-        f.write(ical_data)
-    print(f"Blackboard cache updated successfully in '{BB_CACHE_FILE}'.")
+    kv.set(BB_CACHE_KEY, ical_data)
+    print(f"Blackboard cache updated successfully in Vercel KV.")
     return ical_data
 
-
 # =================================================================
-# Flask 路由和主逻辑
+# Flask 路由
 # =================================================================
 
-def handle_ical_request(cache_file, fetch_function, expiry_days):
-    """通用 iCal 请求处理逻辑"""
-    provided_token = request.args.get('token')
-    if not ICAL_TOKEN or provided_token != ICAL_TOKEN:
-        abort(401, description="Unauthorized: Invalid or missing token.")
+
+@app.route('/api/cron/fetch')
+def cron_fetch_handler():
+    """由 Vercel Cron Job 调用的受保护的 API 端点"""
+    # 安全检查
+    cron_token = request.args.get('cron_token')
+    if not CRON_TOKEN or cron_token != CRON_TOKEN:
+        abort(401, "Unauthorized: Invalid cron token.")
+
+    source = request.args.get('source', 'all')
+    results = {}
+    try:
+        if source in ['tis', 'all']:
+            fetch_and_cache_tis_schedule()
+            results['tis'] = 'success'
+    except Exception as e:
+        results['tis'] = f'failed: {str(e)}'
+        print(f"Error fetching TIS data: {e}")
 
     try:
-        cache_exists = os.path.exists(cache_file)
-        is_cache_expired = False
-        if cache_exists:
-            cache_mod_time = os.path.getmtime(cache_file)
-            if (datetime.now() - datetime.fromtimestamp(cache_mod_time)).days >= expiry_days:
-                is_cache_expired = True
-                print(f"Cache '{cache_file}' is expired.")
-
-        if not cache_exists or is_cache_expired:
-            ical_data = fetch_function()
-        else:
-            print(f"Serving '{cache_file}' from cache.")
-            with open(cache_file, "r", encoding="utf-8") as f:
-                ical_data = f.read()
+        if source in ['bb', 'all']:
+            fetch_and_cache_bb_schedule()
+            results['bb'] = 'success'
     except Exception as e:
-        print(f"An error occurred: {e}")
-        return f"An error occurred: {str(e)}", 500
+        results['bb'] = f'failed: {str(e)}'
+        print(f"Error fetching BB data: {e}")
 
-    return Response(
-        ical_data,
-        mimetype="text/calendar",
-        headers={
-            "Content-Disposition": f"attachment; filename={os.path.basename(cache_file)}"}
-    )
+    return results
 
 
 @app.route('/tis/schedule.ics')
 def get_tis_schedule():
-    """提供 TIS 课表日历"""
-    return handle_ical_request(TIS_CACHE_FILE, fetch_and_cache_tis_schedule, TIS_CACHE_EXPIRY_DAYS)
+    """提供 TIS 课表日历 (从 KV 缓存读取)"""
+    provided_token = request.args.get('token')
+    if not ICAL_TOKEN or provided_token != ICAL_TOKEN:
+        abort(401, "Unauthorized: Invalid or missing token.")
+
+    ical_data = kv.get(TIS_CACHE_KEY)
+    if not ical_data:
+        return "Calendar data is not yet available. Please wait for the next scheduled update (up to 12 hours) or trigger it manually if you are the admin.", 404
+
+    return Response(ical_data, mimetype="text/calendar", headers={"Content-Disposition": "attachment; filename=tis_schedule.ics"})
 
 
 @app.route('/blackboard/schedule.ics')
 def get_bb_schedule():
-    """提供 Blackboard DDL 日历"""
-    return handle_ical_request(BB_CACHE_FILE, fetch_and_cache_bb_schedule, BB_CACHE_EXPIRY_DAYS)
+    """提供 Blackboard DDL 日历 (从 KV 缓存读取)"""
+    provided_token = request.args.get('token')
+    if not ICAL_TOKEN or provided_token != ICAL_TOKEN:
+        abort(401, "Unauthorized: Invalid or missing token.")
 
+    ical_data = kv.get(BB_CACHE_KEY)
+    if not ical_data:
+        return "Calendar data is not yet available. Please wait for the next scheduled update (up to 12 hours) or trigger it manually if you are the admin.", 404
 
-if __name__ == '__main__':
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    return Response(ical_data, mimetype="text/calendar", headers={"Content-Disposition": "attachment; filename=bb_schedule.ics"})

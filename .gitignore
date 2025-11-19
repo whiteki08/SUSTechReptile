@@ -12,6 +12,7 @@
 # 忽略用于存放生成的 .ics 文件的整个目录。
 cache/
 *.json
+!vercel.json
 *.ics
 
 
