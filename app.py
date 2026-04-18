@@ -42,8 +42,13 @@ def _load_kv_client():
 
 kv = _load_kv_client()
 
+SCHEDULER_MODULE_PATH = os.environ.get('SCHEDULER_MODULE_PATH', 'scheduler')
+CAS_QR_AUTH_MODULE_PATH = os.environ.get('CAS_QR_AUTH_MODULE_PATH', 'cas_qr_auth')
+
 try:
-    from external.scheduler import Scheduler, EventSource
+    scheduler_module = import_module(SCHEDULER_MODULE_PATH)
+    Scheduler = scheduler_module.Scheduler
+    EventSource = scheduler_module.EventSource
 except Exception as exc:
     Scheduler = None
     EventSource = None
@@ -52,7 +57,15 @@ else:
     _SCHEDULER_IMPORT_ERROR = None
 
 try:
-    from external.cas_qr_auth import CasQRSessionManager
+    from holiday_provider import HolidayProvider
+except Exception as exc:
+    HolidayProvider = None
+    _HOLIDAY_PROVIDER_IMPORT_ERROR = exc
+else:
+    _HOLIDAY_PROVIDER_IMPORT_ERROR = None
+
+try:
+    CasQRSessionManager = import_module(CAS_QR_AUTH_MODULE_PATH).CasQRSessionManager
 except Exception as exc:
     CasQRSessionManager = None
     _QR_IMPORT_ERROR = exc
@@ -79,6 +92,15 @@ def _sanitize_storage_mode(mode: str) -> str:
         return "dual"
     return candidate
 
+
+def _sanitize_location_prefix(prefix: str | None) -> str:
+    if not prefix:
+        return ""
+    cleaned = prefix.strip()
+    # Vercel 环境变量有时会把引号作为值的一部分传入。
+    cleaned = cleaned.strip('"').strip("'").strip()
+    return cleaned
+
 # --- 配置 ---
 # 这些将从 Vercel 的环境变量中读取
 SUSTECH_SID = os.environ.get('SUSTECH_SID')
@@ -86,6 +108,8 @@ SUSTECH_PASSWORD = os.environ.get('SUSTECH_PASSWORD')
 ICAL_TOKEN = os.environ.get('ICAL_TOKEN')
 CRON_TOKEN = os.environ.get('CRON_TOKEN')  # Cron Job 的安全令牌
 CRON_SECRET = os.environ.get('CRON_SECRET')  # Vercel Cron Bearer 令牌
+HOLIDAY_API_TEMPLATE = os.environ.get('HOLIDAY_API_TEMPLATE', 'https://date.nager.at/api/v3/PublicHolidays/{year}/CN')
+HOLIDAY_API_TIMEOUT_SECONDS = max(1.0, float(os.environ.get('HOLIDAY_API_TIMEOUT_SECONDS', '8')))
 
 REQUESTED_STORAGE_MODE = _sanitize_storage_mode(os.environ.get('SCHEDULE_STORAGE_MODE', 'dual'))
 SCHEDULE_DB_PATH = os.environ.get('SCHEDULE_DB_PATH', os.path.join('data', 'scheduler.db'))
@@ -99,6 +123,7 @@ CAS_QR_BOOTSTRAP_SHOW_URL = _env_bool('CAS_QR_BOOTSTRAP_SHOW_URL', True)
 CAS_QR_ALLOW_PASSWORD_FALLBACK = _env_bool('CAS_QR_ALLOW_PASSWORD_FALLBACK', True)
 ICS_ASYNC_REFRESH_ENABLED = _env_bool('ICS_ASYNC_REFRESH_ENABLED', True)
 ICS_ASYNC_REFRESH_MIN_INTERVAL = max(5, int(os.environ.get('ICS_ASYNC_REFRESH_MIN_INTERVAL', '180')))
+TIS_EXCLUDE_HOLIDAY_EVENTS = _env_bool('TIS_EXCLUDE_HOLIDAY_EVENTS', True)
 
 # --- 通用配置 ---
 SCHEDULE_FETCH_RANGE_DAYS = 120
@@ -153,7 +178,10 @@ def _init_scheduler():
         return None, REQUESTED_STORAGE_MODE
 
     if Scheduler is None:
-        print(f"[storage] scheduler import failed, fallback to kv: {_SCHEDULER_IMPORT_ERROR}")
+        print(
+            f"[storage] scheduler import failed ({SCHEDULER_MODULE_PATH}), "
+            f"fallback to kv: {_SCHEDULER_IMPORT_ERROR}"
+        )
         return None, "kv"
 
     try:
@@ -164,7 +192,26 @@ def _init_scheduler():
         return None, "kv"
 
 
+def _init_holiday_provider():
+    if HolidayProvider is None:
+        print(f"[holiday] provider import failed: {_HOLIDAY_PROVIDER_IMPORT_ERROR}")
+        return None
+    try:
+        return HolidayProvider(
+            api_template=HOLIDAY_API_TEMPLATE,
+            timeout_seconds=HOLIDAY_API_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        print(f"[holiday] provider init failed: {exc}")
+        return None
+
+
 SCHEDULER, STORAGE_MODE = _init_scheduler()
+HOLIDAY_PROVIDER = (
+    getattr(SCHEDULER, "holiday_provider", None)
+    if SCHEDULER is not None
+    else _init_holiday_provider()
+)
 if REQUESTED_STORAGE_MODE != STORAGE_MODE:
     print(f"[storage] requested={REQUESTED_STORAGE_MODE}, effective={STORAGE_MODE}")
 
@@ -172,8 +219,12 @@ print(
     "[boot] "
     f"app_features_version={APP_FEATURES_VERSION} "
     f"storage_mode={STORAGE_MODE} "
+    f"scheduler_module_path={SCHEDULER_MODULE_PATH} "
+    f"cas_qr_auth_module_path={CAS_QR_AUTH_MODULE_PATH} "
     f"kv_client_available={kv is not None} "
-    f"bb_fallback_configured={bool(BB_ICAL_FEED_URL)}"
+    f"bb_fallback_configured={bool(BB_ICAL_FEED_URL)} "
+    f"holiday_provider_available={HOLIDAY_PROVIDER is not None} "
+    f"tis_exclude_holiday_events={TIS_EXCLUDE_HOLIDAY_EVENTS}"
 )
 
 
@@ -217,6 +268,7 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
     cal = Calendar()
     data = json.loads(schedule_json) if isinstance(
         schedule_json, str) else schedule_json
+    location_prefix = _sanitize_location_prefix(os.getenv('LOCATION_PREFIX'))
 
     # COURSE_NAME_FILTER is an exclusion list in JSON array format.
     excluded_course_keywords = []
@@ -234,9 +286,6 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
             pass
 
     for date_str, events in data.items():
-        holiday_name = None
-        if holiday_provider is not None and holiday_provider.is_holiday(date_str):
-            holiday_name = holiday_provider.holiday_name(date_str) or "Holiday"
 
         for item in (events or []):
             class_index = item.get('KSJC') or item.get('ksjc')
@@ -254,6 +303,13 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
             if not start_time_str:
                 continue
             event_day = item.get('SJ') or item.get('sj') or date_str
+
+            holiday_name = None
+            if holiday_provider is not None and holiday_provider.is_holiday(event_day):
+                holiday_name = holiday_provider.holiday_name(event_day) or "Holiday"
+                if TIS_EXCLUDE_HOLIDAY_EVENTS:
+                    continue
+
             naive_begin = datetime.strptime(
                 f"{event_day} {start_time_str}:00", '%Y-%m-%d %H:%M:%S')
             naive_end = datetime.strptime(
@@ -271,14 +327,13 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
             e.end = SHANGHAI_TZ.localize(naive_end)
             location_str = item.get('NR') or item.get('nr')
             if location_str:
-                prefix = os.getenv('LOCATION_PREFIX')
                 replace_dict = {'一教': '第一教学楼', '二教': '第二教学楼',
                                 '三教': '第三教学楼', '智华': '智华教学楼'}
                 for short, full in replace_dict.items():
                     if short in location_str:
                         location_str = location_str.replace(short, full)
                         break
-                e.location = (prefix or '') + location_str
+                e.location = f"{location_prefix}{location_str}" if location_prefix else location_str
             teacher_name = 'N/A'
             bt_string = item.get('BT', '') or item.get('bt', '')
             if ':' in bt_string:
@@ -376,13 +431,13 @@ def fetch_and_cache_tis_schedule():
     schedule_data = service.queryScheduleInterval(
         start_date.strftime('%Y-%m-%d'),
         end_date.strftime('%Y-%m-%d'),
-        holiday_provider=SCHEDULER.holiday_provider if SCHEDULER is not None else None,
-        skip_holidays=False,
+        holiday_provider=HOLIDAY_PROVIDER,
+        skip_holidays=TIS_EXCLUDE_HOLIDAY_EVENTS,
     )
 
     ical_data = convert_tis_json_to_ical(
         schedule_data,
-        holiday_provider=SCHEDULER.holiday_provider if SCHEDULER is not None else None,
+        holiday_provider=HOLIDAY_PROVIDER,
     )
 
     if STORAGE_MODE in {"kv", "dual"}:
@@ -733,6 +788,8 @@ def health():
         "storage_mode_requested": REQUESTED_STORAGE_MODE,
         "kv_client_available": kv is not None,
         "bb_fallback_configured": bool(BB_ICAL_FEED_URL),
+        "holiday_provider_available": HOLIDAY_PROVIDER is not None,
+        "tis_exclude_holiday_events": TIS_EXCLUDE_HOLIDAY_EVENTS,
         "ics_async_refresh_enabled": ICS_ASYNC_REFRESH_ENABLED,
         "qr_bootstrap_enabled": CAS_QR_BOOTSTRAP_ENABLED,
     }
