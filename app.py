@@ -5,6 +5,7 @@ import time
 import sys
 from importlib import import_module
 from datetime import datetime, timedelta
+import requests
 from flask import Flask, Response, request, abort
 from tisService import TisService
 from bbService import bbService
@@ -16,7 +17,8 @@ import re
 def _load_kv_client():
     try:
         return import_module("vercel_kv").kv
-    except Exception:
+    except Exception as exc:
+        print(f"[kv] vercel_kv import failed: {exc}")
         return None
 
 
@@ -94,6 +96,7 @@ CLASS_TIME_MAP = {
 
 # --- Blackboard 特定配置 ---
 BB_CACHE_KEY = "bb_schedule_ics"  # Vercel KV 中的键名
+BB_ICAL_FEED_URL = os.environ.get('BB_ICAL_FEED_URL')
 
 app = Flask(__name__)
 
@@ -166,6 +169,14 @@ def _kv_get(key: str):
     except Exception as exc:
         print(f"[kv] get failed for {key}: {exc}")
         return None
+
+
+def _serialize_calendar(cal: Calendar) -> str:
+    """Use explicit serialize API to avoid upstream deprecation warnings."""
+    serialize = getattr(cal, "serialize", None)
+    if callable(serialize):
+        return serialize()
+    return str(cal)
 
 # =================================================================
 # 数据转换函数 (与之前基本相同)
@@ -243,7 +254,7 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
                 e.status = "CANCELLED"
             e.description = description
             cal.events.add(e)
-    return str(cal)
+    return _serialize_calendar(cal)
 
 
 def convert_bb_json_to_ical(events_json):
@@ -268,7 +279,7 @@ def convert_bb_json_to_ical(events_json):
             continue
         e.description = f"Course: {course_name}\nDescription: Deadline from Blackboard"
         cal.events.add(e)
-    return str(cal)
+    return _serialize_calendar(cal)
 
 
 def _persist_tis_to_db(schedule_data: dict) -> None:
@@ -370,11 +381,37 @@ def fetch_and_cache_bb_schedule():
     today = datetime.now()
     start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
     end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
-    schedule_data = service.queryCalendar(start_date, end_date)
-    if schedule_data is None:
-        raise ConnectionError("BB calendar query failed (None payload).")
+    schedule_data = None
+    ical_data = None
+    primary_failure = None
 
-    ical_data = convert_bb_json_to_ical(schedule_data)
+    try:
+        schedule_data = service.queryCalendar(start_date, end_date)
+    except Exception as exc:
+        primary_failure = f"queryCalendar exception: {exc}"
+
+    if schedule_data:
+        ical_data = convert_bb_json_to_ical(schedule_data)
+    else:
+        if primary_failure is None:
+            primary_failure = "empty payload from queryCalendar"
+
+        if BB_ICAL_FEED_URL:
+            print(f"[info] BB primary fetch failed ({primary_failure}), fallback to BB_ICAL_FEED_URL")
+            try:
+                feed_response = requests.get(BB_ICAL_FEED_URL, timeout=20)
+                feed_response.raise_for_status()
+                fallback_ical = (feed_response.text or "").strip()
+                if not fallback_ical:
+                    raise ValueError("empty response body")
+                ical_data = fallback_ical
+            except Exception as exc:
+                raise ConnectionError(f"BB fallback feed fetch failed: {exc}") from exc
+        else:
+            raise ConnectionError(
+                "BB calendar query failed and no fallback feed configured: "
+                f"{primary_failure}"
+            )
 
     if STORAGE_MODE in {"kv", "dual"}:
         kv_updated = _kv_set(BB_CACHE_KEY, ical_data)
@@ -653,6 +690,9 @@ def health():
     return {
         "status": "ok",
         "storage_mode": STORAGE_MODE,
+        "storage_mode_requested": REQUESTED_STORAGE_MODE,
+        "kv_client_available": kv is not None,
+        "ics_async_refresh_enabled": ICS_ASYNC_REFRESH_ENABLED,
         "qr_bootstrap_enabled": CAS_QR_BOOTSTRAP_ENABLED,
     }
 
