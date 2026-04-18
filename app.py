@@ -15,7 +15,25 @@ import re
 
 
 def _load_kv_client():
+    # 1) Prefer official Upstash Redis client.
+    # Supports both native Upstash env names and Vercel KV env names.
     try:
+        Redis = import_module("upstash_redis").Redis
+        url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL")
+        token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN")
+
+        if url and token:
+            print("[kv] using upstash_redis client (url/token)")
+            return Redis(url=url, token=token)
+
+        print("[kv] using upstash_redis client (from_env)")
+        return Redis.from_env()
+    except Exception as exc:
+        print(f"[kv] upstash_redis init failed: {exc}")
+
+    # 2) Backward compatibility for old vercel_kv usage.
+    try:
+        print("[kv] using vercel_kv client")
         return import_module("vercel_kv").kv
     except Exception as exc:
         print(f"[kv] vercel_kv import failed: {exc}")
