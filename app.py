@@ -1,5 +1,9 @@
 import os
 import json
+import threading
+import time
+import sys
+from importlib import import_module
 from datetime import datetime, timedelta
 from flask import Flask, Response, request, abort
 from tisService import TisService
@@ -7,7 +11,53 @@ from bbService import bbService
 from ics import Calendar, Event
 import pytz
 import re
-from vercel_kv import kv  # 导入 Vercel KV 客户端
+
+
+def _load_kv_client():
+    try:
+        return import_module("vercel_kv").kv
+    except Exception:
+        return None
+
+
+kv = _load_kv_client()
+
+try:
+    from external.scheduler import Scheduler, EventSource
+except Exception as exc:
+    Scheduler = None
+    EventSource = None
+    _SCHEDULER_IMPORT_ERROR = exc
+else:
+    _SCHEDULER_IMPORT_ERROR = None
+
+try:
+    from external.cas_qr_auth import CasQRSessionManager
+except Exception as exc:
+    CasQRSessionManager = None
+    _QR_IMPORT_ERROR = exc
+else:
+    _QR_IMPORT_ERROR = None
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _mask_token(token: str) -> str:
+    if len(token) <= 12:
+        return "*" * len(token)
+    return token[:6] + "..." + token[-6:]
+
+
+def _sanitize_storage_mode(mode: str) -> str:
+    candidate = (mode or "dual").strip().lower()
+    if candidate not in {"kv", "db", "dual"}:
+        return "dual"
+    return candidate
 
 # --- 配置 ---
 # 这些将从 Vercel 的环境变量中读取
@@ -15,6 +65,18 @@ SUSTECH_SID = os.environ.get('SUSTECH_SID')
 SUSTECH_PASSWORD = os.environ.get('SUSTECH_PASSWORD')
 ICAL_TOKEN = os.environ.get('ICAL_TOKEN')
 CRON_TOKEN = os.environ.get('CRON_TOKEN')  # Cron Job 的安全令牌
+CRON_SECRET = os.environ.get('CRON_SECRET')  # Vercel Cron Bearer 令牌
+
+REQUESTED_STORAGE_MODE = _sanitize_storage_mode(os.environ.get('SCHEDULE_STORAGE_MODE', 'dual'))
+SCHEDULE_DB_PATH = os.environ.get('SCHEDULE_DB_PATH', os.path.join('data', 'scheduler.db'))
+
+IS_DOCKER = os.path.exists('/.dockerenv')
+CAS_QR_BOOTSTRAP_ENABLED = _env_bool('CAS_QR_BOOTSTRAP_ENABLED', IS_DOCKER)
+CAS_QR_BOOTSTRAP_REFRESH_SECONDS = max(60, int(os.environ.get('CAS_QR_BOOTSTRAP_REFRESH_SECONDS', '300')))
+CAS_QR_BOOTSTRAP_POLL_INTERVAL = max(0.5, float(os.environ.get('CAS_QR_BOOTSTRAP_POLL_INTERVAL', '3')))
+CAS_QR_BOOTSTRAP_RESTART_DELAY = max(1.0, float(os.environ.get('CAS_QR_BOOTSTRAP_RESTART_DELAY', '2')))
+CAS_QR_BOOTSTRAP_SHOW_URL = _env_bool('CAS_QR_BOOTSTRAP_SHOW_URL', True)
+CAS_QR_ALLOW_PASSWORD_FALLBACK = _env_bool('CAS_QR_ALLOW_PASSWORD_FALLBACK', True)
 
 # --- 通用配置 ---
 SCHEDULE_FETCH_RANGE_DAYS = 120
@@ -33,61 +95,138 @@ BB_CACHE_KEY = "bb_schedule_ics"  # Vercel KV 中的键名
 
 app = Flask(__name__)
 
+_RUNTIME_CAS_TOKEN_LOCK = threading.Lock()
+_RUNTIME_CAS_TOKEN = None
+_QR_THREAD_STARTED = False
+
+
+def _set_runtime_cas_token(token: str | None) -> None:
+    if not token:
+        return
+    global _RUNTIME_CAS_TOKEN
+    with _RUNTIME_CAS_TOKEN_LOCK:
+        _RUNTIME_CAS_TOKEN = token
+
+
+def _get_runtime_cas_token() -> str | None:
+    with _RUNTIME_CAS_TOKEN_LOCK:
+        return _RUNTIME_CAS_TOKEN
+
+
+def _init_scheduler():
+    if REQUESTED_STORAGE_MODE not in {"db", "dual"}:
+        return None, REQUESTED_STORAGE_MODE
+
+    if Scheduler is None:
+        print(f"[storage] scheduler import failed, fallback to kv: {_SCHEDULER_IMPORT_ERROR}")
+        return None, "kv"
+
+    try:
+        scheduler = Scheduler(db_path=SCHEDULE_DB_PATH)
+        return scheduler, REQUESTED_STORAGE_MODE
+    except Exception as exc:
+        print(f"[storage] scheduler init failed, fallback to kv: {exc}")
+        return None, "kv"
+
+
+SCHEDULER, STORAGE_MODE = _init_scheduler()
+if REQUESTED_STORAGE_MODE != STORAGE_MODE:
+    print(f"[storage] requested={REQUESTED_STORAGE_MODE}, effective={STORAGE_MODE}")
+
+
+def _kv_set(key: str, value: str) -> None:
+    if kv is None:
+        return
+    try:
+        kv.set(key, value)
+    except Exception as exc:
+        print(f"[kv] set failed for {key}: {exc}")
+
+
+def _kv_get(key: str):
+    if kv is None:
+        return None
+    try:
+        return kv.get(key)
+    except Exception as exc:
+        print(f"[kv] get failed for {key}: {exc}")
+        return None
+
 # =================================================================
 # 数据转换函数 (与之前基本相同)
 # =================================================================
 
 
-def convert_tis_json_to_ical(schedule_json):
+def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
     """将从 TIS 获取的课表 JSON 转换为 iCalendar 格式字符串"""
     cal = Calendar()
     data = json.loads(schedule_json) if isinstance(
         schedule_json, str) else schedule_json
     for date_str, events in data.items():
+        holiday_name = None
+        if holiday_provider is not None and holiday_provider.is_holiday(date_str):
+            holiday_name = holiday_provider.holiday_name(date_str) or "Holiday"
+
         for item in (events or []):
-            if not item.get('KSJC') or not item.get('KCMC'):
+            class_index = item.get('KSJC') or item.get('ksjc')
+            course_name = item.get('KCMC') or item.get('kcmc')
+            if not class_index or not course_name:
                 continue
+
+            try:
+                class_index = int(class_index)
+            except (TypeError, ValueError):
+                continue
+
             start_time_str, end_time_str = CLASS_TIME_MAP.get(
-                item['KSJC'], (None, None))
+                class_index, (None, None))
             if not start_time_str:
                 continue
+            event_day = item.get('SJ') or item.get('sj') or date_str
             naive_begin = datetime.strptime(
-                f"{item['SJ']} {start_time_str}:00", '%Y-%m-%d %H:%M:%S')
+                f"{event_day} {start_time_str}:00", '%Y-%m-%d %H:%M:%S')
             naive_end = datetime.strptime(
-                f"{item['SJ']} {end_time_str}:00", '%Y-%m-%d %H:%M:%S')
+                f"{event_day} {end_time_str}:00", '%Y-%m-%d %H:%M:%S')
             e = Event()
-            e.name = item.get('KCMC')
-            filter = os.getenv('COURSE_NAME_FILTER')
-            # filter is a array
+            e.name = course_name
+            course_filter = os.getenv('COURSE_NAME_FILTER')
+            # course_filter is a JSON array
             flag = True
-            if filter:
-                filter_list = json.loads(filter)
-                flag = False
-                for keyword in filter_list:
-                    if keyword in e.name:
-                        flag = True
-                        break
+            if course_filter:
+                try:
+                    filter_list = json.loads(course_filter)
+                    flag = False
+                    for keyword in filter_list:
+                        if keyword in e.name:
+                            flag = True
+                            break
+                except ValueError:
+                    pass
             if not flag:
                 continue
             e.begin = SHANGHAI_TZ.localize(naive_begin)
             e.end = SHANGHAI_TZ.localize(naive_end)
-            location_str = item.get('NR')
+            location_str = item.get('NR') or item.get('nr')
             if location_str:
                 prefix = os.getenv('LOCATION_PREFIX')
                 replace_dict = {'一教': '第一教学楼', '二教': '第二教学楼',
-                                '三教': '第三教学楼', '智华': '第三教学楼'}
+                                '三教': '第三教学楼', '智华': '智华教学楼'}
                 for short, full in replace_dict.items():
                     if short in location_str:
                         location_str = location_str.replace(short, full)
                         break
                 e.location = (prefix or '') + location_str
             teacher_name = 'N/A'
-            bt_string = item.get('BT', '')
+            bt_string = item.get('BT', '') or item.get('bt', '')
             if ':' in bt_string:
                 match = re.match(r'([^\d]*)', bt_string.split(':', 1)[1])
                 if match:
                     teacher_name = match.group(1)
-            e.description = f"教师: {teacher_name}\n课程标题: {bt_string}"
+            description = f"教师: {teacher_name}\n课程标题: {bt_string}"
+            if holiday_name:
+                description = description + f"\nHoliday anomaly: {holiday_name}"
+                e.status = "CANCELLED"
+            e.description = description
             cal.events.add(e)
     return str(cal)
 
@@ -116,58 +255,227 @@ def convert_bb_json_to_ical(events_json):
         cal.events.add(e)
     return str(cal)
 
+
+def _persist_tis_to_db(schedule_data: dict) -> None:
+    if SCHEDULER is None or STORAGE_MODE not in {"db", "dual"}:
+        return
+    count = SCHEDULER.replace_tis_raw_schedule(schedule_data, clear_old=True)
+    print(f"TIS db sync completed, events={count}")
+
+
+def _persist_bb_to_db(events_json: list) -> None:
+    if SCHEDULER is None or STORAGE_MODE not in {"db", "dual"}:
+        return
+    count = SCHEDULER.replace_bb_raw_events(events_json, clear_old=True)
+    print(f"BB db sync completed, events={count}")
+
+
+def _read_calendar_payload(source: str):
+    source = source.lower()
+    cache_key = TIS_CACHE_KEY if source == 'tis' else BB_CACHE_KEY
+
+    if SCHEDULER is not None and STORAGE_MODE in {"db", "dual"}:
+        source_name = "tis" if source == 'tis' else "bb"
+        if EventSource is not None:
+            source_name = EventSource.TIS.value if source == 'tis' else EventSource.BB.value
+        if SCHEDULER.has_events(source=source_name):
+            return SCHEDULER.export_ics(source=source_name)
+
+    if STORAGE_MODE in {"kv", "dual"}:
+        return _kv_get(cache_key)
+
+    return None
+
 # =================================================================
 # 数据抓取与缓存函数 (修改为写入 Vercel KV)
 # =================================================================
 
 
 def fetch_and_cache_tis_schedule():
-    """抓取 TIS 课表并更新到 Vercel KV"""
+    """抓取 TIS 课表并写入启用的存储后端。"""
     print("Fetching new schedule from TIS...")
-    service = TisService()
-    if not service.Login():
+    service = TisService(tgc_token=_get_runtime_cas_token())
+    if not service.Login(use_qr=False, allow_password_fallback=CAS_QR_ALLOW_PASSWORD_FALLBACK):
         raise ConnectionError("TIS CAS Login Failed.")
-    service.LoginTIS()
+    if not service.LoginTIS():
+        # 运行时 token 可能过期，重试一次完整登录流程。
+        service.TGC = None
+        if not service.Login(use_qr=_env_bool("CAS_USE_QR_LOGIN", False), allow_password_fallback=CAS_QR_ALLOW_PASSWORD_FALLBACK):
+            raise ConnectionError("TIS CAS Login Failed (retry).")
+        if not service.LoginTIS():
+            raise ConnectionError("TIS Login Failed.")
+
+    _set_runtime_cas_token(service.TGC)
+
     today = datetime.now()
     start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
     end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
     schedule_data = service.queryScheduleInterval(
-        start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-    ical_data = convert_tis_json_to_ical(schedule_data)
-    kv.set(TIS_CACHE_KEY, ical_data)
-    print(f"TIS cache updated successfully in Vercel KV.")
+        start_date.strftime('%Y-%m-%d'),
+        end_date.strftime('%Y-%m-%d'),
+        holiday_provider=SCHEDULER.holiday_provider if SCHEDULER is not None else None,
+        skip_holidays=False,
+    )
+
+    ical_data = convert_tis_json_to_ical(
+        schedule_data,
+        holiday_provider=SCHEDULER.holiday_provider if SCHEDULER is not None else None,
+    )
+
+    if STORAGE_MODE in {"kv", "dual"}:
+        _kv_set(TIS_CACHE_KEY, ical_data)
+        print("TIS cache updated successfully in Vercel KV.")
+
+    if STORAGE_MODE in {"db", "dual"}:
+        _persist_tis_to_db(schedule_data)
+
     return ical_data
 
 
 def fetch_and_cache_bb_schedule():
-    """抓取 Blackboard 日历事件并更新到 Vercel KV"""
+    """抓取 Blackboard 日历事件并写入启用的存储后端。"""
     print("Fetching new schedule from Blackboard...")
-    service = bbService()
-    if not service.Login():
+    service = bbService(tgc_token=_get_runtime_cas_token())
+    if not service.Login(use_qr=False, allow_password_fallback=CAS_QR_ALLOW_PASSWORD_FALLBACK):
         raise ConnectionError("BB CAS Login Failed.")
     if not service.LoginBB():
-        raise ConnectionError("BB Login Failed.")
+        service.TGC = None
+        if not service.Login(use_qr=_env_bool("CAS_USE_QR_LOGIN", False), allow_password_fallback=CAS_QR_ALLOW_PASSWORD_FALLBACK):
+            raise ConnectionError("BB CAS Login Failed (retry).")
+        if not service.LoginBB():
+            raise ConnectionError("BB Login Failed.")
+
+    _set_runtime_cas_token(service.TGC)
+
     today = datetime.now()
     start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
     end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
     schedule_data = service.queryCalendar(start_date, end_date)
     ical_data = convert_bb_json_to_ical(schedule_data)
-    kv.set(BB_CACHE_KEY, ical_data)
-    print(f"Blackboard cache updated successfully in Vercel KV.")
+
+    if STORAGE_MODE in {"kv", "dual"}:
+        _kv_set(BB_CACHE_KEY, ical_data)
+        print("Blackboard cache updated successfully in Vercel KV.")
+
+    if STORAGE_MODE in {"db", "dual"}:
+        _persist_bb_to_db(schedule_data or [])
+
     return ical_data
+
+
+def _run_qr_bootstrap_loop() -> None:
+    if CasQRSessionManager is None:
+        print(f"[qr] cas qr manager unavailable: {_QR_IMPORT_ERROR}")
+        return
+
+    print("[qr] bootstrap thread started")
+    sys.stdout.flush()
+    manager = CasQRSessionManager(ttl_seconds=CAS_QR_BOOTSTRAP_REFRESH_SECONDS)
+
+    while True:
+        try:
+            payload = manager.create_session()
+            session_id = str(payload.get("session_id") or "")
+            signature = str(payload.get("signature") or "")
+            qr_url = str(payload.get("qr_url") or "")
+            expires_in = int(payload.get("expires_in") or CAS_QR_BOOTSTRAP_REFRESH_SECONDS)
+            qr_ascii = payload.get("qr_ascii")
+
+            print("\n=== CAS QR Bootstrap ===")
+            if CAS_QR_BOOTSTRAP_SHOW_URL and qr_url:
+                print(f"[qr] url={qr_url}")
+            if isinstance(qr_ascii, str) and qr_ascii.strip():
+                print("--- Scan This QR (ASCII) ---")
+                print(qr_ascii)
+            print(f"[qr] expires_in={expires_in}s")
+            sys.stdout.flush()
+
+            start = time.time()
+            last_status = None
+            authorized = False
+            while time.time() - start <= expires_in + 5:
+                status_payload = manager.poll_status(session_id, signature)
+                status = str(status_payload.get("status") or "unknown")
+
+                if status != last_status:
+                    print(f"[qr] status={status}")
+                    sys.stdout.flush()
+                    last_status = status
+
+                if status == "authorized":
+                    exchange_code = str(status_payload.get("exchange_code") or "")
+                    token_payload = manager.exchange_token(session_id, signature, exchange_code)
+                    if token_payload.get("ok"):
+                        cas_token = str(token_payload.get("cas_token") or "")
+                        _set_runtime_cas_token(cas_token)
+                        print(f"[qr] CAS token acquired: {_mask_token(cas_token)}")
+                    else:
+                        print(f"[qr] token exchange failed: {token_payload}")
+                    sys.stdout.flush()
+                    authorized = True
+                    break
+
+                if status in {"cancel", "warning", "expired", "invalid_signature"}:
+                    break
+
+                time.sleep(CAS_QR_BOOTSTRAP_POLL_INTERVAL)
+
+            if authorized:
+                # 成功后等待当前二维码周期结束再重打，避免日志刷屏。
+                time.sleep(max(30.0, float(expires_in)))
+            else:
+                time.sleep(CAS_QR_BOOTSTRAP_RESTART_DELAY)
+        except Exception as exc:
+            print(f"[qr] bootstrap loop error: {exc}")
+            sys.stdout.flush()
+            time.sleep(CAS_QR_BOOTSTRAP_RESTART_DELAY)
+
+
+def _start_background_workers() -> None:
+    global _QR_THREAD_STARTED
+    if _QR_THREAD_STARTED:
+        return
+    if not CAS_QR_BOOTSTRAP_ENABLED:
+        return
+    if CasQRSessionManager is None:
+        print(f"[qr] disabled because manager import failed: {_QR_IMPORT_ERROR}")
+        return
+
+    thread = threading.Thread(
+        target=_run_qr_bootstrap_loop,
+        name="cas-qr-bootstrap",
+        daemon=True,
+    )
+    thread.start()
+    _QR_THREAD_STARTED = True
+
+
+_start_background_workers()
 
 # =================================================================
 # Flask 路由
 # =================================================================
 
 
+def _is_cron_request_authorized() -> bool:
+    auth_header = request.headers.get('Authorization', '')
+    if CRON_SECRET and auth_header == f"Bearer {CRON_SECRET}":
+        return True
+
+    # 兼容历史 query 参数鉴权方式。
+    cron_token = request.args.get('cron_token')
+    if CRON_TOKEN and cron_token == CRON_TOKEN:
+        return True
+
+    return False
+
+
 @app.route('/api/cron/fetch')
 def cron_fetch_handler():
     """由 Vercel Cron Job 调用的受保护的 API 端点"""
     # 安全检查
-    cron_token = request.args.get('cron_token')
-    if not CRON_TOKEN or cron_token != CRON_TOKEN:
-        abort(401, "Unauthorized: Invalid cron token.")
+    if not _is_cron_request_authorized():
+        abort(401, "Unauthorized: Invalid cron credential.")
 
     source = request.args.get('source', 'all')
     results = {}
@@ -190,14 +498,23 @@ def cron_fetch_handler():
     return results
 
 
+@app.route('/')
+def health():
+    return {
+        "status": "ok",
+        "storage_mode": STORAGE_MODE,
+        "qr_bootstrap_enabled": CAS_QR_BOOTSTRAP_ENABLED,
+    }
+
+
 @app.route('/tis/schedule.ics')
 def get_tis_schedule():
-    """提供 TIS 课表日历 (从 KV 缓存读取)"""
+    """提供 TIS 课表日历 (按存储模式读取)"""
     provided_token = request.args.get('token')
     if not ICAL_TOKEN or provided_token != ICAL_TOKEN:
         abort(401, "Unauthorized: Invalid or missing token.")
 
-    ical_data = kv.get(TIS_CACHE_KEY)
+    ical_data = _read_calendar_payload('tis')
     if not ical_data:
         return "Calendar data is not yet available. Please wait for the next scheduled update (up to 12 hours) or trigger it manually if you are the admin.", 404
 
@@ -206,13 +523,20 @@ def get_tis_schedule():
 
 @app.route('/blackboard/schedule.ics')
 def get_bb_schedule():
-    """提供 Blackboard DDL 日历 (从 KV 缓存读取)"""
+    """提供 Blackboard DDL 日历 (按存储模式读取)"""
     provided_token = request.args.get('token')
     if not ICAL_TOKEN or provided_token != ICAL_TOKEN:
         abort(401, "Unauthorized: Invalid or missing token.")
 
-    ical_data = kv.get(BB_CACHE_KEY)
+    ical_data = _read_calendar_payload('bb')
     if not ical_data:
         return "Calendar data is not yet available. Please wait for the next scheduled update (up to 12 hours) or trigger it manually if you are the admin.", 404
 
     return Response(ical_data, mimetype="text/calendar", headers={"Content-Disposition": "attachment; filename=bb_schedule.ics"})
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get("PORT", "5001"))
+    print(f"Starting service on 0.0.0.0:{port}, storage={STORAGE_MODE}")
+    sys.stdout.flush()
+    app.run(host='0.0.0.0', port=port)

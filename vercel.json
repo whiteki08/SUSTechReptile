@@ -1,6 +1,5 @@
 {
   "version": 2,
-  "framework": "flask",
   "builds": [
     {
       "src": "app.py",
@@ -15,7 +14,7 @@
   ],
   "crons": [
     {
-      "path": "/api/cron/fetch?source=all&cron_token=${CRON_TOKEN}",
+      "path": "/api/cron/fetch?source=all",
       "schedule": "0 2 * * *"
     }
   ]

@@ -16,8 +16,22 @@
 - **轻松部署**: 使用 Docker 和 Docker Compose 完全容器化，一条命令即可完成部署。
 - **智能格式化**:
   - 自动转换课程地点简写（如“一教”->“第一教学楼”）。
+- **Docker 日志扫码登录**:
+  - 容器启动后会在日志中输出可扫描的 ASCII 二维码。
+  - 扫码成功后自动缓存 CAS token，并在二维码过期后自动重打。
+- **双存储后端（可切换）**:
+  - 支持 `Vercel KV`、`SQLite` 或 `双写` 模式（默认双写）。
+  - 数据读取可按配置优先走数据库导出 ICS。
+- **节假日避退标记**:
+  - 节假日课程不会消失，而是导出为 `CANCELLED` 事件并保留说明。
 
 ## 🚀 部署指南
+
+### Vercel 部署（Serverless）
+
+如果你希望直接部署到 Vercel，请先阅读详细教程：
+
+- [Vercel 部署详细教程](docs/vercel-deployment.md)
 
 部署此服务需要你有一台拥有公网 IP 的服务器，并为其准备一个域名。
 
@@ -58,11 +72,35 @@
     # 用于订阅链接的安全令牌，请设置为一个长且随机的字符串,可以使用`openssl rand -base64 32`生成
     ICAL_TOKEN=
 
+    # Cron 接口鉴权令牌
+    CRON_TOKEN=
+
     # 可选：地点前缀，避免地点信息过于简略
     LOCATION_PREFIX="塘朗科技大专"
 
     # 可选：过滤关键词列表，包含任意关键词的课程将被过滤掉
     COURSE_NAME_FILTER=["创新实践"]
+
+    # 可选：存储模式，kv / db / dual
+    SCHEDULE_STORAGE_MODE=dual
+
+    # 可选：SQLite 路径（db 或 dual 模式生效）
+    SCHEDULE_DB_PATH=/app/data/scheduler.db
+
+    # 可选：启用容器启动二维码日志输出（默认 Docker 内启用）
+    CAS_QR_BOOTSTRAP_ENABLED=true
+
+    # 可选：二维码刷新周期（秒）
+    CAS_QR_BOOTSTRAP_REFRESH_SECONDS=300
+
+    # 可选：二维码状态轮询间隔（秒）
+    CAS_QR_BOOTSTRAP_POLL_INTERVAL=3
+
+    # 可选：二维码失败后是否回退账号密码登录
+    CAS_QR_ALLOW_PASSWORD_FALLBACK=true
+
+    # 可选：是否默认在 CAS 登录时使用二维码流程
+    CAS_USE_QR_LOGIN=false
 
     ```
 
@@ -77,23 +115,40 @@
     }
     ```
 
-4.  **创建缓存目录**
-    服务需要一个目录来存放生成的日历缓存文件。
+4.  **创建运行目录**
+  服务需要目录来存放缓存和数据库文件。
 
     ```bash
-    mkdir cache
+  mkdir -p cache data
     ```
 
 5.  **启动服务**
     在项目根目录下，运行以下命令：
     ```bash
-    docker-compose up -d
+    docker-compose up -d --build
     ```
     Docker Compose 将会自动构建镜像、启动服务容器和 Caddy 代理。Caddy 会为你的域名自动申请并配置 SSL 证书。
 
 ## 🗓️ 如何使用
 
 服务启动后，你将获得两个独立的日历订阅链接。建议将它们都添加到你的日历应用中。
+
+### Docker 日志扫码登录
+
+首次启动后可直接查看二维码日志并扫码：
+
+```bash
+docker logs -f sustech-ical-service
+```
+
+你会看到以下关键日志片段：
+
+- `=== CAS QR Bootstrap ===`：表示已生成新的二维码。
+- `--- Scan This QR (ASCII) ---`：下方即为可扫码二维码。
+- `[qr] status=authorized`：表示扫码授权成功。
+- `[qr] CAS token acquired: xxx...yyy`：表示 token 已缓存，可用于后续抓取。
+
+如果二维码过期，服务会自动重新打印新二维码。
 
 #### 1. TIS 课程表日历
 
