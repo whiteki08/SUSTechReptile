@@ -97,6 +97,7 @@ CLASS_TIME_MAP = {
 # --- Blackboard 特定配置 ---
 BB_CACHE_KEY = "bb_schedule_ics"  # Vercel KV 中的键名
 BB_ICAL_FEED_URL = os.environ.get('BB_ICAL_FEED_URL')
+APP_FEATURES_VERSION = "2026-04-19-bb-fallback-ics-async"
 
 app = Flask(__name__)
 
@@ -146,6 +147,14 @@ def _init_scheduler():
 SCHEDULER, STORAGE_MODE = _init_scheduler()
 if REQUESTED_STORAGE_MODE != STORAGE_MODE:
     print(f"[storage] requested={REQUESTED_STORAGE_MODE}, effective={STORAGE_MODE}")
+
+print(
+    "[boot] "
+    f"app_features_version={APP_FEATURES_VERSION} "
+    f"storage_mode={STORAGE_MODE} "
+    f"kv_client_available={kv is not None} "
+    f"bb_fallback_configured={bool(BB_ICAL_FEED_URL)}"
+)
 
 
 def _kv_set(key: str, value: str) -> bool:
@@ -391,6 +400,7 @@ def fetch_and_cache_bb_schedule():
         primary_failure = f"queryCalendar exception: {exc}"
 
     if schedule_data:
+        print(f"[info] BB primary fetch succeeded, events={len(schedule_data)}")
         ical_data = convert_bb_json_to_ical(schedule_data)
     else:
         if primary_failure is None:
@@ -405,6 +415,7 @@ def fetch_and_cache_bb_schedule():
                 if not fallback_ical:
                     raise ValueError("empty response body")
                 ical_data = fallback_ical
+                print(f"[info] BB fallback feed fetch succeeded, bytes={len(fallback_ical)}")
             except Exception as exc:
                 raise ConnectionError(f"BB fallback feed fetch failed: {exc}") from exc
         else:
@@ -689,9 +700,11 @@ def cron_fetch_handler():
 def health():
     return {
         "status": "ok",
+        "app_features_version": APP_FEATURES_VERSION,
         "storage_mode": STORAGE_MODE,
         "storage_mode_requested": REQUESTED_STORAGE_MODE,
         "kv_client_available": kv is not None,
+        "bb_fallback_configured": bool(BB_ICAL_FEED_URL),
         "ics_async_refresh_enabled": ICS_ASYNC_REFRESH_ENABLED,
         "qr_bootstrap_enabled": CAS_QR_BOOTSTRAP_ENABLED,
     }
