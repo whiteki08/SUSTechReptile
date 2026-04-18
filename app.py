@@ -217,6 +217,22 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
     cal = Calendar()
     data = json.loads(schedule_json) if isinstance(
         schedule_json, str) else schedule_json
+
+    # COURSE_NAME_FILTER is an exclusion list in JSON array format.
+    excluded_course_keywords = []
+    raw_course_filter = os.getenv('COURSE_NAME_FILTER')
+    if raw_course_filter:
+        try:
+            parsed = json.loads(raw_course_filter)
+            if isinstance(parsed, list):
+                excluded_course_keywords = [
+                    str(keyword).strip()
+                    for keyword in parsed
+                    if str(keyword).strip()
+                ]
+        except ValueError:
+            pass
+
     for date_str, events in data.items():
         holiday_name = None
         if holiday_provider is not None and holiday_provider.is_holiday(date_str):
@@ -244,21 +260,13 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
                 f"{event_day} {end_time_str}:00", '%Y-%m-%d %H:%M:%S')
             e = Event()
             e.name = course_name
-            course_filter = os.getenv('COURSE_NAME_FILTER')
-            # course_filter is a JSON array
-            flag = True
-            if course_filter:
-                try:
-                    filter_list = json.loads(course_filter)
-                    flag = False
-                    for keyword in filter_list:
-                        if keyword in e.name:
-                            flag = True
-                            break
-                except ValueError:
-                    pass
-            if not flag:
+
+            # Exclude events whose course names match any configured keyword.
+            if excluded_course_keywords and any(
+                keyword in e.name for keyword in excluded_course_keywords
+            ):
                 continue
+
             e.begin = SHANGHAI_TZ.localize(naive_begin)
             e.end = SHANGHAI_TZ.localize(naive_end)
             location_str = item.get('NR') or item.get('nr')
