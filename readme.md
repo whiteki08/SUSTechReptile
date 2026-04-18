@@ -102,6 +102,9 @@
     # 可选：是否默认在 CAS 登录时使用二维码流程
     CAS_USE_QR_LOGIN=false
 
+    # 可选：Blackboard 静态 iCal 回退链接（当 BB JSON 接口异常时启用）
+    BB_ICAL_FEED_URL=
+
     ```
 
 3.  **配置 `Caddyfile`**

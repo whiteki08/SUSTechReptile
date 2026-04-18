@@ -5,6 +5,7 @@ import time
 import sys
 from importlib import import_module
 from datetime import datetime, timedelta
+import requests
 from flask import Flask, Response, request, abort
 from tisService import TisService
 from bbService import bbService
@@ -14,9 +15,28 @@ import re
 
 
 def _load_kv_client():
+    # 1) Prefer official Upstash Redis client.
+    # Supports both native Upstash env names and Vercel KV env names.
     try:
+        Redis = import_module("upstash_redis").Redis
+        url = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL")
+        token = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN")
+
+        if url and token:
+            print("[kv] using upstash_redis client (url/token)")
+            return Redis(url=url, token=token)
+
+        print("[kv] using upstash_redis client (from_env)")
+        return Redis.from_env()
+    except Exception as exc:
+        print(f"[kv] upstash_redis init failed: {exc}")
+
+    # 2) Backward compatibility for old vercel_kv usage.
+    try:
+        print("[kv] using vercel_kv client")
         return import_module("vercel_kv").kv
-    except Exception:
+    except Exception as exc:
+        print(f"[kv] vercel_kv import failed: {exc}")
         return None
 
 
@@ -77,6 +97,8 @@ CAS_QR_BOOTSTRAP_POLL_INTERVAL = max(0.5, float(os.environ.get('CAS_QR_BOOTSTRAP
 CAS_QR_BOOTSTRAP_RESTART_DELAY = max(1.0, float(os.environ.get('CAS_QR_BOOTSTRAP_RESTART_DELAY', '2')))
 CAS_QR_BOOTSTRAP_SHOW_URL = _env_bool('CAS_QR_BOOTSTRAP_SHOW_URL', True)
 CAS_QR_ALLOW_PASSWORD_FALLBACK = _env_bool('CAS_QR_ALLOW_PASSWORD_FALLBACK', True)
+ICS_ASYNC_REFRESH_ENABLED = _env_bool('ICS_ASYNC_REFRESH_ENABLED', True)
+ICS_ASYNC_REFRESH_MIN_INTERVAL = max(5, int(os.environ.get('ICS_ASYNC_REFRESH_MIN_INTERVAL', '180')))
 
 # --- 通用配置 ---
 SCHEDULE_FETCH_RANGE_DAYS = 120
@@ -92,12 +114,25 @@ CLASS_TIME_MAP = {
 
 # --- Blackboard 特定配置 ---
 BB_CACHE_KEY = "bb_schedule_ics"  # Vercel KV 中的键名
+BB_ICAL_FEED_URL = os.environ.get('BB_ICAL_FEED_URL')
+APP_FEATURES_VERSION = "2026-04-19-bb-fallback-ics-async"
+APP_BUILD_COMMIT = os.environ.get('VERCEL_GIT_COMMIT_SHA') or os.environ.get('GIT_COMMIT_SHA')
+APP_RUNTIME_ENV = os.environ.get('VERCEL_ENV') or os.environ.get('ENV') or 'unknown'
 
 app = Flask(__name__)
 
 _RUNTIME_CAS_TOKEN_LOCK = threading.Lock()
 _RUNTIME_CAS_TOKEN = None
 _QR_THREAD_STARTED = False
+_REFRESH_SOURCE_LOCKS = {
+    'tis': threading.Lock(),
+    'bb': threading.Lock(),
+}
+_ASYNC_REFRESH_STATE_LOCK = threading.Lock()
+_LAST_ASYNC_REFRESH_AT = {
+    'tis': 0.0,
+    'bb': 0.0,
+}
 
 
 def _set_runtime_cas_token(token: str | None) -> None:
@@ -133,24 +168,44 @@ SCHEDULER, STORAGE_MODE = _init_scheduler()
 if REQUESTED_STORAGE_MODE != STORAGE_MODE:
     print(f"[storage] requested={REQUESTED_STORAGE_MODE}, effective={STORAGE_MODE}")
 
+print(
+    "[boot] "
+    f"app_features_version={APP_FEATURES_VERSION} "
+    f"storage_mode={STORAGE_MODE} "
+    f"kv_client_available={kv is not None} "
+    f"bb_fallback_configured={bool(BB_ICAL_FEED_URL)}"
+)
 
-def _kv_set(key: str, value: str) -> None:
+
+def _kv_set(key: str, value: str) -> bool:
     if kv is None:
-        return
+        print(f"[kv] client unavailable, skip set for {key}")
+        return False
     try:
         kv.set(key, value)
+        return True
     except Exception as exc:
         print(f"[kv] set failed for {key}: {exc}")
+        return False
 
 
 def _kv_get(key: str):
     if kv is None:
+        print(f"[kv] client unavailable, skip get for {key}")
         return None
     try:
         return kv.get(key)
     except Exception as exc:
         print(f"[kv] get failed for {key}: {exc}")
         return None
+
+
+def _serialize_calendar(cal: Calendar) -> str:
+    """Use explicit serialize API to avoid upstream deprecation warnings."""
+    serialize = getattr(cal, "serialize", None)
+    if callable(serialize):
+        return serialize()
+    return str(cal)
 
 # =================================================================
 # 数据转换函数 (与之前基本相同)
@@ -228,7 +283,7 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
                 e.status = "CANCELLED"
             e.description = description
             cal.events.add(e)
-    return str(cal)
+    return _serialize_calendar(cal)
 
 
 def convert_bb_json_to_ical(events_json):
@@ -253,7 +308,7 @@ def convert_bb_json_to_ical(events_json):
             continue
         e.description = f"Course: {course_name}\nDescription: Deadline from Blackboard"
         cal.events.add(e)
-    return str(cal)
+    return _serialize_calendar(cal)
 
 
 def _persist_tis_to_db(schedule_data: dict) -> None:
@@ -323,8 +378,13 @@ def fetch_and_cache_tis_schedule():
     )
 
     if STORAGE_MODE in {"kv", "dual"}:
-        _kv_set(TIS_CACHE_KEY, ical_data)
-        print("TIS cache updated successfully in Vercel KV.")
+        kv_updated = _kv_set(TIS_CACHE_KEY, ical_data)
+        if kv_updated:
+            print("TIS cache updated successfully in Vercel KV.")
+        else:
+            print("TIS cache update skipped/failed in Vercel KV.")
+            if STORAGE_MODE == "kv":
+                raise ConnectionError("TIS cache update failed in kv mode.")
 
     if STORAGE_MODE in {"db", "dual"}:
         _persist_tis_to_db(schedule_data)
@@ -350,17 +410,144 @@ def fetch_and_cache_bb_schedule():
     today = datetime.now()
     start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
     end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
-    schedule_data = service.queryCalendar(start_date, end_date)
-    ical_data = convert_bb_json_to_ical(schedule_data)
+    schedule_data = None
+    ical_data = None
+    primary_failure = None
+
+    try:
+        schedule_data = service.queryCalendar(start_date, end_date)
+    except Exception as exc:
+        primary_failure = f"queryCalendar exception: {exc}"
+
+    if schedule_data:
+        print(f"[info] BB primary fetch succeeded, events={len(schedule_data)}")
+        ical_data = convert_bb_json_to_ical(schedule_data)
+    else:
+        if primary_failure is None:
+            primary_failure = "empty payload from queryCalendar"
+
+        if BB_ICAL_FEED_URL:
+            print(f"[info] BB primary fetch failed ({primary_failure}), fallback to BB_ICAL_FEED_URL")
+            try:
+                feed_response = requests.get(BB_ICAL_FEED_URL, timeout=20)
+                feed_response.raise_for_status()
+                fallback_ical = (feed_response.text or "").strip()
+                if not fallback_ical:
+                    raise ValueError("empty response body")
+                ical_data = fallback_ical
+                print(f"[info] BB fallback feed fetch succeeded, bytes={len(fallback_ical)}")
+            except Exception as exc:
+                raise ConnectionError(f"BB fallback feed fetch failed: {exc}") from exc
+        else:
+            raise ConnectionError(
+                "BB calendar query failed and no fallback feed configured: "
+                f"{primary_failure}"
+            )
 
     if STORAGE_MODE in {"kv", "dual"}:
-        _kv_set(BB_CACHE_KEY, ical_data)
-        print("Blackboard cache updated successfully in Vercel KV.")
+        kv_updated = _kv_set(BB_CACHE_KEY, ical_data)
+        if kv_updated:
+            print("Blackboard cache updated successfully in Vercel KV.")
+        else:
+            print("Blackboard cache update skipped/failed in Vercel KV.")
+            if STORAGE_MODE == "kv":
+                raise ConnectionError("BB cache update failed in kv mode.")
 
     if STORAGE_MODE in {"db", "dual"}:
         _persist_bb_to_db(schedule_data or [])
 
     return ical_data
+
+
+def _refresh_source_with_lock(source: str, trigger: str, blocking: bool = False) -> dict:
+    lock = _REFRESH_SOURCE_LOCKS.get(source)
+    if lock is None:
+        return {
+            "ok": False,
+            "source": source,
+            "status": "error",
+            "message": "unknown source",
+            "trigger": trigger,
+            "duration_ms": 0,
+        }
+
+    started = time.time()
+    acquired = lock.acquire(blocking=blocking)
+    if not acquired:
+        return {
+            "ok": False,
+            "source": source,
+            "status": "skipped",
+            "message": "refresh already running",
+            "trigger": trigger,
+            "duration_ms": int((time.time() - started) * 1000),
+        }
+
+    result = {
+        "ok": True,
+        "source": source,
+        "status": "success",
+        "message": "",
+        "trigger": trigger,
+    }
+    try:
+        payload = fetch_and_cache_tis_schedule() if source == 'tis' else fetch_and_cache_bb_schedule()
+        if isinstance(payload, str):
+            result["payload_size"] = len(payload)
+        elif isinstance(payload, (list, dict)):
+            result["payload_size"] = len(payload)
+        else:
+            result["payload_size"] = None
+    except Exception as exc:
+        result["ok"] = False
+        result["status"] = "failed"
+        result["message"] = str(exc)
+    finally:
+        result["duration_ms"] = int((time.time() - started) * 1000)
+        lock.release()
+
+    return result
+
+
+def _trigger_async_refresh(source: str, reason: str) -> dict:
+    if not ICS_ASYNC_REFRESH_ENABLED:
+        return {"scheduled": False, "reason": "disabled"}
+
+    if source not in _REFRESH_SOURCE_LOCKS:
+        return {"scheduled": False, "reason": "unknown-source"}
+
+    now = time.time()
+    with _ASYNC_REFRESH_STATE_LOCK:
+        elapsed = now - _LAST_ASYNC_REFRESH_AT[source]
+        if elapsed < ICS_ASYNC_REFRESH_MIN_INTERVAL:
+            return {
+                "scheduled": False,
+                "reason": "cooldown",
+                "retry_after_seconds": int(ICS_ASYNC_REFRESH_MIN_INTERVAL - elapsed),
+            }
+
+        if _REFRESH_SOURCE_LOCKS[source].locked():
+            return {"scheduled": False, "reason": "running"}
+
+        _LAST_ASYNC_REFRESH_AT[source] = now
+
+    def _worker() -> None:
+        print(f"[ics-refresh] start source={source} reason={reason}")
+        refresh_result = _refresh_source_with_lock(source, trigger=f"ics:{reason}", blocking=False)
+        print(
+            "[ics-refresh] done "
+            f"source={source} status={refresh_result.get('status')} "
+            f"duration_ms={refresh_result.get('duration_ms')} "
+            f"message={refresh_result.get('message', '')}"
+        )
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"ics-refresh-{source}",
+        daemon=True,
+    )
+    thread.start()
+    return {"scheduled": True, "reason": "started"}
 
 
 def _run_qr_bootstrap_loop() -> None:
@@ -473,37 +660,86 @@ def _is_cron_request_authorized() -> bool:
 @app.route('/api/cron/fetch')
 def cron_fetch_handler():
     """由 Vercel Cron Job 调用的受保护的 API 端点"""
+    request_started_at = time.time()
+    request_id = request.headers.get('x-vercel-id') or request.headers.get('x-request-id') or 'n/a'
+    source = request.args.get('source', 'all').strip().lower()
+    user_agent = request.headers.get('user-agent', 'unknown')
+
+    print(f"[cron] incoming request_id={request_id} source={source} user_agent={user_agent}")
+
     # 安全检查
     if not _is_cron_request_authorized():
+        print(f"[cron] unauthorized request_id={request_id}")
         abort(401, "Unauthorized: Invalid cron credential.")
 
-    source = request.args.get('source', 'all')
-    results = {}
-    try:
-        if source in ['tis', 'all']:
-            fetch_and_cache_tis_schedule()
-            results['tis'] = 'success'
-    except Exception as e:
-        results['tis'] = f'failed: {str(e)}'
-        print(f"Error fetching TIS data: {e}")
+    if source not in {'tis', 'bb', 'all'}:
+        print(f"[cron] invalid source request_id={request_id} source={source}")
+        return {
+            "ok": False,
+            "request_id": request_id,
+            "error": f"invalid source: {source}",
+        }, 400
 
-    try:
-        if source in ['bb', 'all']:
-            fetch_and_cache_bb_schedule()
-            results['bb'] = 'success'
-    except Exception as e:
-        results['bb'] = f'failed: {str(e)}'
-        print(f"Error fetching BB data: {e}")
+    auth_mode = 'query'
+    auth_header = request.headers.get('Authorization', '')
+    if CRON_SECRET and auth_header == f"Bearer {CRON_SECRET}":
+        auth_mode = 'bearer'
+    print(f"[cron] authorized request_id={request_id} auth_mode={auth_mode}")
 
-    return results
+    steps = {}
+    ordered_sources = ['tis', 'bb'] if source == 'all' else [source]
+    for source_name in ordered_sources:
+        print(f"[cron] refresh start request_id={request_id} source={source_name}")
+        result = _refresh_source_with_lock(
+            source_name,
+            trigger=f"cron:{request_id}",
+            blocking=False,
+        )
+        steps[source_name] = result
+        print(
+            "[cron] refresh done "
+            f"request_id={request_id} source={source_name} "
+            f"status={result.get('status')} duration_ms={result.get('duration_ms')} "
+            f"message={result.get('message', '')}"
+        )
+
+    ok = all(step.get('status') in {'success', 'skipped'} for step in steps.values())
+    response = {
+        "ok": ok,
+        "request_id": request_id,
+        "source": source,
+        "auth_mode": auth_mode,
+        "duration_ms": int((time.time() - request_started_at) * 1000),
+        "steps": steps,
+    }
+    print(f"[cron] completed request_id={request_id} ok={ok} duration_ms={response['duration_ms']}")
+    return response
 
 
 @app.route('/')
 def health():
     return {
         "status": "ok",
+        "app_features_version": APP_FEATURES_VERSION,
         "storage_mode": STORAGE_MODE,
+        "storage_mode_requested": REQUESTED_STORAGE_MODE,
+        "kv_client_available": kv is not None,
+        "bb_fallback_configured": bool(BB_ICAL_FEED_URL),
+        "ics_async_refresh_enabled": ICS_ASYNC_REFRESH_ENABLED,
         "qr_bootstrap_enabled": CAS_QR_BOOTSTRAP_ENABLED,
+    }
+
+
+@app.route('/app_features_version')
+def app_features_version():
+    """Deployment fingerprint endpoint for quick version verification."""
+    return {
+        "app_features_version": APP_FEATURES_VERSION,
+        "build_commit": APP_BUILD_COMMIT,
+        "runtime_env": APP_RUNTIME_ENV,
+        "storage_mode": STORAGE_MODE,
+        "bb_fallback_configured": bool(BB_ICAL_FEED_URL),
+        "kv_client_available": kv is not None,
     }
 
 
@@ -515,6 +751,9 @@ def get_tis_schedule():
         abort(401, "Unauthorized: Invalid or missing token.")
 
     ical_data = _read_calendar_payload('tis')
+    refresh_meta = _trigger_async_refresh('tis', reason='tis-ics-hit')
+    print(f"[ics] source=tis cache_hit={bool(ical_data)} refresh={refresh_meta}")
+
     if not ical_data:
         return "Calendar data is not yet available. Please wait for the next scheduled update (up to 12 hours) or trigger it manually if you are the admin.", 404
 
@@ -529,10 +768,19 @@ def get_bb_schedule():
         abort(401, "Unauthorized: Invalid or missing token.")
 
     ical_data = _read_calendar_payload('bb')
+    refresh_meta = _trigger_async_refresh('bb', reason='bb-ics-hit')
+    print(f"[ics] source=bb cache_hit={bool(ical_data)} refresh={refresh_meta}")
+
     if not ical_data:
         return "Calendar data is not yet available. Please wait for the next scheduled update (up to 12 hours) or trigger it manually if you are the admin.", 404
 
     return Response(ical_data, mimetype="text/calendar", headers={"Content-Disposition": "attachment; filename=bb_schedule.ics"})
+
+
+@app.route('/bb/schedule.ics')
+def get_bb_schedule_alias():
+    """兼容旧路径：转发到 blackboard 日历端点。"""
+    return get_bb_schedule()
 
 
 if __name__ == '__main__':

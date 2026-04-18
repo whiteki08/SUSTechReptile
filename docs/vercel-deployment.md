@@ -137,6 +137,16 @@ https://<your-vercel-domain>/blackboard/schedule.ics?token=<ICAL_TOKEN>
 2. 查看函数日志确认 TIS/BB 是否抓取成功。
 3. 确认 KV 已连接且 `SCHEDULE_STORAGE_MODE=kv`。
 
+### 10.4 健康检查里 `kv_client_available=false`
+
+当前实现优先使用 `upstash_redis.Redis.from_env()`，并兼容 Vercel KV 变量映射（`KV_REST_API_URL` / `KV_REST_API_TOKEN`）。
+
+检查顺序：
+
+1. 确认部署安装了依赖 `upstash-redis`（本仓库 `requirements.txt` 已包含）。
+2. 确认项目已连接 KV，且函数环境中存在 `KV_REST_API_URL` 与 `KV_REST_API_TOKEN`。
+3. 重新部署后查看函数日志中的 `[kv]` 前缀信息，定位是 `upstash_redis` 初始化失败还是回退到 `vercel_kv`。
+
 ### 10.3 Blackboard 间歇性 500
 
 这是上游服务偶发问题，项目中已加入预热、重试与分片兜底。

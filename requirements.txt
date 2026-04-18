@@ -3,6 +3,7 @@ ics
 pytz
 requests
 lxml
+upstash-redis
 vercel-kv
 sqlmodel
 qrcode[pil]
