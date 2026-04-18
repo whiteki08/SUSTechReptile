@@ -4,6 +4,9 @@ FROM python:3.10-slim
 # 2. 设置工作目录，容器内所有操作都将在这个目录下进行
 WORKDIR /app
 
+# 让 print 日志实时输出到 docker logs。
+ENV PYTHONUNBUFFERED=1
+
 # 3. 复制依赖文件到工作目录
 #    我们先复制这个文件并安装依赖，这样可以利用 Docker 的缓存机制。
 #    只要 requirements.txt 不变，就不需要重新安装依赖。
