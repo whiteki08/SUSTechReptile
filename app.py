@@ -98,6 +98,8 @@ CLASS_TIME_MAP = {
 BB_CACHE_KEY = "bb_schedule_ics"  # Vercel KV 中的键名
 BB_ICAL_FEED_URL = os.environ.get('BB_ICAL_FEED_URL')
 APP_FEATURES_VERSION = "2026-04-19-bb-fallback-ics-async"
+APP_BUILD_COMMIT = os.environ.get('VERCEL_GIT_COMMIT_SHA') or os.environ.get('GIT_COMMIT_SHA')
+APP_RUNTIME_ENV = os.environ.get('VERCEL_ENV') or os.environ.get('ENV') or 'unknown'
 
 app = Flask(__name__)
 
@@ -707,6 +709,19 @@ def health():
         "bb_fallback_configured": bool(BB_ICAL_FEED_URL),
         "ics_async_refresh_enabled": ICS_ASYNC_REFRESH_ENABLED,
         "qr_bootstrap_enabled": CAS_QR_BOOTSTRAP_ENABLED,
+    }
+
+
+@app.route('/app_features_version')
+def app_features_version():
+    """Deployment fingerprint endpoint for quick version verification."""
+    return {
+        "app_features_version": APP_FEATURES_VERSION,
+        "build_commit": APP_BUILD_COMMIT,
+        "runtime_env": APP_RUNTIME_ENV,
+        "storage_mode": STORAGE_MODE,
+        "bb_fallback_configured": bool(BB_ICAL_FEED_URL),
+        "kv_client_available": kv is not None,
     }
 
 
