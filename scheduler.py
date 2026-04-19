@@ -22,15 +22,17 @@ from pydantic import field_validator
 # ---------------------------------------------------------------------------
 # 路径设置：兼容直接运行和包导入
 # ---------------------------------------------------------------------------
-_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
-_SUSTECH_DIR = os.path.join(_BACKEND_DIR, "sustech")
-if _SUSTECH_DIR not in sys.path:
-    sys.path.insert(0, _SUSTECH_DIR)
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_DIR not in sys.path:
+    sys.path.insert(0, _PROJECT_DIR)
 
-from sustech.bb import bbService
-from sustech.tis import TisService
+try:
+    from bbService import bbService
+    from tisService import TisService
+except ImportError:
+    # Backward compatibility for old package layout.
+    from sustech.bb import bbService
+    from sustech.tis import TisService
 try:
     from .holiday_provider import HolidayProvider
 except ImportError:
@@ -447,7 +449,7 @@ def get_engine(db_path: Optional[str] = None):
         db_path: SQLite 文件路径，None 则使用默认路径，":memory:" 使用内存数据库
     """
     if db_path is None:
-        db_path = os.path.join(_BACKEND_DIR, "data", "scheduler.db")
+        db_path = os.path.join(_PROJECT_DIR, "data", "scheduler.db")
 
     if db_path == ":memory:":
         url = "sqlite://"
@@ -779,6 +781,45 @@ class Scheduler:
                 e.is_deleted = True
                 e.last_modified = _now_utc()
                 session.add(e)
+        return count
+
+    def _replace_source_events(self, source: str, events: List[VEvent], clear_old: bool = True) -> int:
+        """替换指定来源的事件集合（兼容 app.py 的旧调用路径）。"""
+        with self._session() as session:
+            if clear_old:
+                deleted = self._delete_by_source(session, source, hard=True)
+                logger.info(
+                    "scheduler replace source old records removed",
+                    extra={"source": source, "count": deleted},
+                )
+            for event in events:
+                session.add(event)
+            session.commit()
+        return len(events)
+
+    def replace_bb_raw_events(self, raw_events: list, clear_old: bool = True) -> int:
+        """将 Blackboard 原始事件列表解析后写入数据库。"""
+        events = EventParser.parse_bb_events(raw_events or [])
+        count = self._replace_source_events(EventSource.BB.value, events, clear_old=clear_old)
+        self.last_sync_report = {
+            "source": EventSource.BB.value,
+            "synced_events": count,
+        }
+        return count
+
+    def replace_tis_raw_schedule(self, schedule_data: dict, clear_old: bool = True) -> int:
+        """将 TIS 课表字典解析后写入数据库。"""
+        events, parse_stats = EventParser.parse_tis_schedule(
+            schedule_data or {},
+            holiday_provider=self.holiday_provider,
+        )
+        count = self._replace_source_events(EventSource.TIS.value, events, clear_old=clear_old)
+        self.last_sync_report = {
+            "source": EventSource.TIS.value,
+            "synced_events": count,
+            "holiday_cancelled_events": parse_stats.get("holiday_cancelled", 0),
+            "parse_failed": parse_stats.get("parse_failed", 0),
+        }
         return count
 
     def sync_bb(
@@ -1125,6 +1166,15 @@ class Scheduler:
     def search_events(self, keyword: str, limit: int = 50) -> List[VEvent]:
         return self.query_events(keyword=keyword, limit=limit)
 
+    def has_events(
+        self,
+        source: Optional[str] = None,
+        include_deleted: bool = False,
+    ) -> bool:
+        """Compatibility helper for callers that need a quick existence check."""
+        events = self.query_events(source=source, include_deleted=include_deleted, limit=1)
+        return bool(events)
+
     # ================================================================
     #  CRUD: Update
     # ================================================================
@@ -1230,6 +1280,7 @@ class Scheduler:
         self,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
+        source: Optional[str] = None,
         prodid: str = "-//SUSTech Student Agent//Scheduler//CN",
     ) -> str:
         """
@@ -1238,7 +1289,7 @@ class Scheduler:
         Returns:
             RFC 5545 VCALENDAR 字符串
         """
-        events = self.query_events(start=start, end=end)
+        events = self.query_events(start=start, end=end, source=source)
         lines = [
             "BEGIN:VCALENDAR",
             "VERSION:2.0",

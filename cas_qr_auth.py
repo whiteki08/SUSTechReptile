@@ -12,16 +12,18 @@ from threading import Lock
 from typing import Callable
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _BACKEND_DIR not in sys.path:
-    sys.path.insert(0, _BACKEND_DIR)
-_SUSTECH_DIR = os.path.join(_BACKEND_DIR, "sustech")
-if _SUSTECH_DIR not in sys.path:
-    sys.path.insert(0, _SUSTECH_DIR)
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PROJECT_DIR not in sys.path:
+    sys.path.insert(0, _PROJECT_DIR)
 
 try:
-    from sustech.cas import CasService
+    from casService import CasService
 except ImportError:
-    from cas import CasService
+    # Backward compatibility for old package layout.
+    try:
+        from sustech.cas import CasService
+    except ImportError:
+        from cas import CasService
 
 try:
     from .qr_utils import build_qr_png_base64, render_qr_ascii

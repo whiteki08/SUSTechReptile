@@ -6,13 +6,13 @@ services:
     container_name: sustech-ical-service
     env_file:
       - .env
-    environment:
-      - SCHEDULE_STORAGE_MODE=dual
-      - SCHEDULE_DB_PATH=/app/data/scheduler.db
-      - CAS_QR_BOOTSTRAP_ENABLED=true
-      - CAS_QR_BOOTSTRAP_REFRESH_SECONDS=300
-      - CAS_QR_BOOTSTRAP_POLL_INTERVAL=3
-      - CAS_QR_ALLOW_PASSWORD_FALLBACK=true
+    # environment:
+    #   - SCHEDULE_STORAGE_MODE=dual
+    #   - SCHEDULE_DB_PATH=/app/data/scheduler.db
+    #   - CAS_QR_BOOTSTRAP_ENABLED=true
+    #   - CAS_QR_BOOTSTRAP_REFRESH_SECONDS=300
+    #   - CAS_QR_BOOTSTRAP_POLL_INTERVAL=3
+    #   - CAS_QR_ALLOW_PASSWORD_FALLBACK=true
     # 不再需要将端口暴露给主机，因为它只和 Caddy 通信
     # ports:
     #   - "5001:5001"
