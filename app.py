@@ -441,7 +441,7 @@ def _read_calendar_payload(source: str):
             source_name = (
                 EventSource.TIS.value if source == "tis" else EventSource.BB.value
             )
-        if SCHEDULER.has_events(source=source_name):
+        if len(SCHEDULER.query_events(source=source_name, limit=1)) > 0:
             return SCHEDULER.export_ics(source=source_name)
 
     if STORAGE_MODE in {"kv", "dual"}:
