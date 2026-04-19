@@ -5,7 +5,8 @@ import json
 import time
 import sys
 from typing import Optional, Any
-
+import dotenv
+dotenv.load_dotenv(".env")
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)

@@ -364,110 +364,137 @@ class bbService(CasService):
             "[bb-debug] normalized query window "
             f"start_cst={start_local.isoformat()} end_cst={end_local.isoformat()}"
         )
-        headers = self._calendar_request_headers()
+        def _query_once() -> Optional[list]:
+            headers = self._calendar_request_headers()
+            self._warmup_calendar_context(headers)
 
-        self._warmup_calendar_context(headers)
-
-        # 第一阶段：整段重试，优先拿到完整区间。
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            data = self._request_calendar_window(
-                headers,
-                start_ts,
-                end_ts,
-                phase="primary",
-                attempt=attempt,
-                max_attempts=max_attempts,
-            )
-            if data is not None:
-                print(f"Query BB calendar successfully! attempt={attempt}, events={len(data)}")
-                return data
-
-            if attempt < max_attempts:
-                backoff = float(attempt)
-                print(f"Retrying BB calendar query in {backoff:.1f}s (attempt {attempt + 1}/{max_attempts})...")
-                time.sleep(backoff)
-                self._warmup_calendar_context(headers)
-
-        # 第二阶段：分片查询，降低单次请求压力并尽量规避节点抖动。
-        chunk_days = 14
-        merged_events = []
-        seen_ids = set()
-        failed_chunks = 0
-        chunk_count = 0
-        failed_chunk_labels = []
-
-        cursor = start_date
-        while cursor < end_date:
-            chunk_count += 1
-            next_cursor = min(cursor + datetime.timedelta(days=chunk_days), end_date)
-            chunk_start_ts = int(cursor.timestamp() * 1000)
-            chunk_end_ts = int(next_cursor.timestamp() * 1000)
-            chunk_label = (
-                f"{cursor.strftime('%Y-%m-%d')} -> {next_cursor.strftime('%Y-%m-%d')}"
-            )
-
-            chunk_data = None
-            for chunk_attempt in range(1, 3):
-                chunk_data = self._request_calendar_window(
+            # 第一阶段：整段重试，优先拿到完整区间。
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                data = self._request_calendar_window(
                     headers,
-                    chunk_start_ts,
-                    chunk_end_ts,
-                    phase="chunked",
-                    attempt=chunk_attempt,
-                    max_attempts=2,
-                    chunk_label=chunk_label,
+                    start_ts,
+                    end_ts,
+                    phase="primary",
+                    attempt=attempt,
+                    max_attempts=max_attempts,
                 )
-                if chunk_data is not None:
-                    break
-                if chunk_attempt < 2:
-                    time.sleep(0.8)
+                if data is not None:
+                    print(
+                        f"Query BB calendar successfully! attempt={attempt}, events={len(data)}"
+                    )
+                    return data
+
+                if attempt < max_attempts:
+                    backoff = float(attempt)
+                    print(
+                        "Retrying BB calendar query in "
+                        f"{backoff:.1f}s (attempt {attempt + 1}/{max_attempts})..."
+                    )
+                    time.sleep(backoff)
                     self._warmup_calendar_context(headers)
 
-            if chunk_data is None:
-                failed_chunks += 1
-                failed_chunk_labels.append(chunk_label)
-                print(
-                    "Chunk query failed: "
-                    f"{chunk_label}"
+            # 第二阶段：分片查询，降低单次请求压力并尽量规避节点抖动。
+            # 经验上 42 天窗口与浏览器手工请求更接近，稳定性更高。
+            chunk_days = 42
+            merged_events = []
+            seen_ids = set()
+            failed_chunks = 0
+            chunk_count = 0
+            failed_chunk_labels = []
+
+            cursor = start_local
+            while cursor < end_local:
+                chunk_count += 1
+                next_cursor = min(cursor + datetime.timedelta(days=chunk_days), end_local)
+                chunk_start_ts = int(cursor.timestamp() * 1000)
+                chunk_end_ts = int(next_cursor.timestamp() * 1000)
+                chunk_label = (
+                    f"{cursor.strftime('%Y-%m-%d')} -> {next_cursor.strftime('%Y-%m-%d')}"
                 )
-            else:
-                for item in chunk_data:
-                    event_key = item.get("id") or item.get("itemSourceId")
-                    if not event_key:
-                        event_key = json.dumps(item, sort_keys=True, ensure_ascii=True)
-                    if event_key in seen_ids:
-                        continue
-                    seen_ids.add(event_key)
-                    merged_events.append(item)
 
-            cursor = next_cursor
+                chunk_data = None
+                for chunk_attempt in range(1, 3):
+                    chunk_data = self._request_calendar_window(
+                        headers,
+                        chunk_start_ts,
+                        chunk_end_ts,
+                        phase="chunked",
+                        attempt=chunk_attempt,
+                        max_attempts=2,
+                        chunk_label=chunk_label,
+                    )
+                    if chunk_data is not None:
+                        break
+                    if chunk_attempt < 2:
+                        time.sleep(0.8)
+                        self._warmup_calendar_context(headers)
 
-        if failed_chunks == 0:
-            print(
-                "Query BB calendar succeeded via chunked fallback. "
-                f"chunks={chunk_count}, events={len(merged_events)}"
-            )
-            return merged_events
+                if chunk_data is None:
+                    failed_chunks += 1
+                    failed_chunk_labels.append(chunk_label)
+                    print(
+                        "Chunk query failed: "
+                        f"{chunk_label}"
+                    )
+                else:
+                    for item in chunk_data:
+                        event_key = item.get("id") or item.get("itemSourceId")
+                        if not event_key:
+                            event_key = json.dumps(item, sort_keys=True, ensure_ascii=True)
+                        if event_key in seen_ids:
+                            continue
+                        seen_ids.add(event_key)
+                        merged_events.append(item)
 
-        if merged_events:
-            print(
-                "Query BB calendar partially succeeded via chunked fallback. "
-                f"failed_chunks={failed_chunks}/{chunk_count}, events={len(merged_events)}"
-            )
+                cursor = next_cursor
+
+            if failed_chunks == 0:
+                print(
+                    "Query BB calendar succeeded via chunked fallback. "
+                    f"chunks={chunk_count}, events={len(merged_events)}"
+                )
+                return merged_events
+
+            if merged_events:
+                print(
+                    "Query BB calendar partially succeeded via chunked fallback. "
+                    f"failed_chunks={failed_chunks}/{chunk_count}, events={len(merged_events)}"
+                )
+                if failed_chunk_labels:
+                    print(
+                        "[bb-debug] failed chunk list: "
+                        + "; ".join(failed_chunk_labels)
+                    )
+                return merged_events
+
             if failed_chunk_labels:
                 print(
                     "[bb-debug] failed chunk list: "
                     + "; ".join(failed_chunk_labels)
                 )
-            return merged_events
+            return None
 
-        if failed_chunk_labels:
-            print(
-                "[bb-debug] failed chunk list: "
-                + "; ".join(failed_chunk_labels)
-            )
-        print("Query BB calendar failed after retries and chunked fallback.")
+        data = _query_once()
+        if data is not None:
+            return data
+
+        # 第三阶段：重建会话并重新交换 BB ticket，再完整重试一轮。
+        # 目的：绕过偶发异常节点或失效上下文，避免稳定命中 500。
+        print("[bb-debug] restarting BB session after failed primary/chunked query...")
+        try:
+            self.session = requests.Session()
+            if not self.LoginBB():
+                print("[bb-debug] BB session restart failed during LoginBB.")
+            else:
+                data = _query_once()
+                if data is not None:
+                    print("[bb-debug] BB query recovered after session restart.")
+                    return data
+        except Exception as exc:
+            print(f"[bb-debug] session restart retry exception: {exc}")
+
+        print("Query BB calendar failed after retries, chunked fallback, and session restart.")
         return None
 
 
