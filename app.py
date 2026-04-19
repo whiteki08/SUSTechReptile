@@ -114,7 +114,7 @@ ICAL_TOKEN = os.environ.get("ICAL_TOKEN")
 CRON_TOKEN = os.environ.get("CRON_TOKEN")  # Cron Job 的安全令牌
 CRON_SECRET = os.environ.get("CRON_SECRET")  # Vercel Cron Bearer 令牌
 HOLIDAY_API_TEMPLATE = os.environ.get(
-    "HOLIDAY_API_TEMPLATE", "https://date.nager.at/api/v3/PublicHolidays/{year}/CN"
+    "HOLIDAY_API_TEMPLATE", "https://api.jiejiariapi.com/v1/holidays/{year}"
 )
 HOLIDAY_API_TIMEOUT_SECONDS = max(
     1.0, float(os.environ.get("HOLIDAY_API_TIMEOUT_SECONDS", "8"))
@@ -140,6 +140,7 @@ CAS_QR_BOOTSTRAP_RESTART_DELAY = max(
 )
 CAS_QR_BOOTSTRAP_SHOW_URL = _env_bool("CAS_QR_BOOTSTRAP_SHOW_URL", True)
 CAS_QR_ALLOW_PASSWORD_FALLBACK = _env_bool("CAS_QR_ALLOW_PASSWORD_FALLBACK", True)
+BB_USE_RUNTIME_CAS_TOKEN = _env_bool("BB_USE_RUNTIME_CAS_TOKEN", False)
 ICS_ASYNC_REFRESH_ENABLED = _env_bool("ICS_ASYNC_REFRESH_ENABLED", True)
 ICS_ASYNC_REFRESH_MIN_INTERVAL = max(
     5, int(os.environ.get("ICS_ASYNC_REFRESH_MIN_INTERVAL", "180"))
@@ -249,6 +250,7 @@ print(
     f"scheduler_module_path={SCHEDULER_MODULE_PATH} "
     f"cas_qr_auth_module_path={CAS_QR_AUTH_MODULE_PATH} "
     f"kv_client_available={kv is not None} "
+    f"bb_use_runtime_cas_token={BB_USE_RUNTIME_CAS_TOKEN} "
     f"bb_fallback_configured={bool(BB_ICAL_FEED_URL)} "
     f"holiday_provider_available={HOLIDAY_PROVIDER is not None} "
     f"tis_exclude_holiday_events={TIS_EXCLUDE_HOLIDAY_EVENTS}"
@@ -391,12 +393,7 @@ def convert_bb_json_to_ical(events_json):
         e = Event()
         course_name = item.get("calendarName", "Unknown Course")
         event_title = item.get("title", "未命名事件")
-        event_type = item.get("eventType", "Event")
-        e.name = (
-            f"「{course_name}」 {event_title}"
-            if event_type in ["Assignment", "作业"]
-            else f"[{course_name}] {event_title}"
-        )
+        e.name = f"「{course_name}」 {event_title}"
         try:
             start_str = (
                 item["startDate"][:-1] + "+00:00"
@@ -412,7 +409,14 @@ def convert_bb_json_to_ical(events_json):
             e.end = datetime.fromisoformat(end_str)
         except (KeyError, ValueError):
             continue
-        e.description = f"Course: {course_name}\nDescription: Deadline from Blackboard"
+        raw_desc = str(item.get("description") or "").strip()
+        if raw_desc.lower().startswith("description:"):
+            desc_line = raw_desc
+        elif raw_desc:
+            desc_line = f"Description: {raw_desc}"
+        else:
+            desc_line = "Description: Deadline from Blackboard"
+        e.description = f"Course: {course_name}\n{desc_line}"
         cal.events.add(e)
     return _serialize_calendar(cal)
 
@@ -509,7 +513,8 @@ def fetch_and_cache_tis_schedule():
 def fetch_and_cache_bb_schedule():
     """抓取 Blackboard 日历事件并写入启用的存储后端。"""
     print("Fetching new schedule from Blackboard...")
-    service = bbService(tgc_token=_get_runtime_cas_token())
+    runtime_token = _get_runtime_cas_token() if BB_USE_RUNTIME_CAS_TOKEN else None
+    service = bbService(tgc_token=runtime_token)
     if not service.Login(
         use_qr=False, allow_password_fallback=CAS_QR_ALLOW_PASSWORD_FALLBACK
     ):
@@ -532,6 +537,7 @@ def fetch_and_cache_bb_schedule():
     schedule_data = None
     ical_data = None
     primary_failure = None
+    db_synced = False
 
     try:
         schedule_data = service.queryCalendar(start_date, end_date)
@@ -540,7 +546,24 @@ def fetch_and_cache_bb_schedule():
 
     if schedule_data:
         print(f"[info] BB primary fetch succeeded, events={len(schedule_data)}")
-        ical_data = convert_bb_json_to_ical(schedule_data)
+        if STORAGE_MODE in {"db", "dual"}:
+            _persist_bb_to_db(schedule_data)
+            db_synced = True
+
+        if SCHEDULER is not None and STORAGE_MODE in {"db", "dual"}:
+            source_name = "bb"
+            if EventSource is not None:
+                source_name = EventSource.BB.value
+            try:
+                ical_data = SCHEDULER.export_ics(source=source_name)
+            except Exception as exc:
+                print(
+                    "[warn] BB db export failed, fallback to direct JSON->ICS conversion: "
+                    f"{exc}"
+                )
+                ical_data = convert_bb_json_to_ical(schedule_data)
+        else:
+            ical_data = convert_bb_json_to_ical(schedule_data)
     else:
         if primary_failure is None:
             primary_failure = "empty payload from queryCalendar"
@@ -576,7 +599,7 @@ def fetch_and_cache_bb_schedule():
             if STORAGE_MODE == "kv":
                 raise ConnectionError("BB cache update failed in kv mode.")
 
-    if STORAGE_MODE in {"db", "dual"}:
+    if STORAGE_MODE in {"db", "dual"} and not db_synced:
         _persist_bb_to_db(schedule_data or [])
 
     return ical_data

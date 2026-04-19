@@ -234,7 +234,7 @@ class VEvent(SQLModel, table=True):
                 d[key] = _cst_str(val)
         return d
 
-    def to_ics_string(self) -> str:
+    def to_ics_string(self, legacy_bb_style: bool = False) -> str:
         """
         导出为 ICS VEVENT 文本块
 
@@ -284,8 +284,56 @@ class VEvent(SQLModel, table=True):
 
         out_lines: List[str] = []
 
+        def _build_bb_summary() -> str:
+            course = (self.x_course_name or "").strip()
+            title = (self.summary or "").strip()
+            if course and title:
+                prefix = f"「{course}」"
+                if title.startswith(prefix):
+                    return title
+                return f"{prefix} {title}"
+            return title or course or "Blackboard Deadline"
+
+        def _build_bb_description() -> Optional[str]:
+            parts: List[str] = []
+            course = (self.x_course_name or "").strip()
+            if course:
+                parts.append(f"Course: {course}")
+
+            raw_desc = (self.description or "").strip()
+            if raw_desc:
+                if raw_desc.lower().startswith("description:"):
+                    parts.append(raw_desc)
+                else:
+                    parts.append(f"Description: {raw_desc}")
+            else:
+                parts.append("Description: Deadline from Blackboard")
+
+            if self.location:
+                parts.append(f"Location: {self.location}")
+
+            return "\n".join(parts) if parts else None
+
         def _add_line(line: str) -> None:
             out_lines.extend(_fold_ics_line(line))
+
+        bb_event = self.x_source == EventSource.BB.value
+        bb_summary = _build_bb_summary() if bb_event else (self.summary or "")
+        bb_description = _build_bb_description() if bb_event else self.description
+
+        if legacy_bb_style and bb_event:
+
+            _add_line("BEGIN:VEVENT")
+            if bb_description:
+                _add_line(f"DESCRIPTION:{_escape_ics_text(bb_description)}")
+            if self.dtend:
+                _add_line(f"DTEND:{_dt_fmt(self.dtend)}")
+            _add_line(f"DTSTAMP:{_dt_fmt(self.dtstamp)}")
+            _add_line(f"DTSTART:{_dt_fmt(self.dtstart)}")
+            _add_line(f"SUMMARY:{_escape_ics_text(bb_summary)}")
+            _add_line(f"UID:{self.uid}")
+            _add_line("END:VEVENT")
+            return "\r\n".join(out_lines)
 
         _add_line("BEGIN:VEVENT")
         _add_line(f"UID:{self.uid}")
@@ -295,10 +343,10 @@ class VEvent(SQLModel, table=True):
             _add_line(f"DTEND:{_dt_fmt(self.dtend)}")
         if self.duration:
             _add_line(f"DURATION:{self.duration}")
-        if self.summary:
-            _add_line(f"SUMMARY:{_escape_ics_text(self.summary)}")
-        if self.description:
-            _add_line(f"DESCRIPTION:{_escape_ics_text(self.description)}")
+        if bb_summary:
+            _add_line(f"SUMMARY:{_escape_ics_text(bb_summary)}")
+        if bb_description:
+            _add_line(f"DESCRIPTION:{_escape_ics_text(bb_description)}")
         if self.location:
             _add_line(f"LOCATION:{_escape_ics_text(self.location)}")
         if self.url:
@@ -1340,16 +1388,30 @@ class Scheduler:
             RFC 5545 VCALENDAR 字符串
         """
         events = self.query_events(start=start, end=end, source=source)
-        lines = [
-            "BEGIN:VCALENDAR",
-            "VERSION:2.0",
-            f"PRODID:{prodid}",
-            "CALSCALE:GREGORIAN",
-            "METHOD:PUBLISH",
-            "X-WR-TIMEZONE:Asia/Shanghai",
-        ]
+        source_value = (source or "").lower()
+        events_all_bb = bool(events) and all(
+            e.x_source == EventSource.BB.value for e in events
+        )
+        legacy_bb_style = source_value == EventSource.BB.value or events_all_bb
+
+        if legacy_bb_style:
+            # Keep bb output concise and human-readable, aligned with legacy format.
+            lines = [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "PRODID:ics.py - http://git.io/lLljaA",
+            ]
+        else:
+            lines = [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                f"PRODID:{prodid}",
+                "CALSCALE:GREGORIAN",
+                "METHOD:PUBLISH",
+                "X-WR-TIMEZONE:Asia/Shanghai",
+            ]
         for e in events:
-            lines.append(e.to_ics_string())
+            lines.append(e.to_ics_string(legacy_bb_style=legacy_bb_style))
         lines.append("END:VCALENDAR")
         return "\r\n".join(lines)
 
