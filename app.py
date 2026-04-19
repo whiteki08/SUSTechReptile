@@ -476,7 +476,7 @@ def fetch_and_cache_tis_schedule():
 
     _set_runtime_cas_token(service.TGC)
 
-    today = datetime.now()
+    today = datetime.now(SHANGHAI_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     start_date = today - timedelta(days=SCHEDULE_PAST_DAYS)
     end_date = today + timedelta(days=SCHEDULE_FETCH_RANGE_DAYS)
     schedule_data = service.queryScheduleInterval(

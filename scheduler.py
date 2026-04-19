@@ -472,6 +472,15 @@ def get_engine(db_path: Optional[str] = None):
 class EventParser:
     """将 BB / TIS 原始数据解析为 VEvent 对象"""
 
+    TIS_CLASS_TIME_MAP = {
+        1: ("08:00", "09:50"),
+        3: ("10:20", "12:10"),
+        5: ("14:00", "15:50"),
+        7: ("16:20", "18:10"),
+        9: ("19:00", "20:50"),
+        11: ("21:00", "21:50"),
+    }
+
     # ---- Blackboard ----
 
     @staticmethod
@@ -593,9 +602,28 @@ class EventParser:
         """
         now = _now_utc()
 
+        def _pick(*keys: str, default=None):
+            for key in keys:
+                if key in raw and raw.get(key) not in (None, ""):
+                    return raw.get(key)
+            return default
+
         # --- 时间 ---
-        kssj = raw.get("kssj") or raw.get("qssj") or ""
-        jssj = raw.get("jssj") or ""
+        kssj = str(_pick("kssj", "qssj", "KSSJ", "QSSJ", default="") or "")
+        jssj = str(_pick("jssj", "JSSJ", default="") or "")
+
+        class_index = _pick("ksjc", "KSJC")
+        try:
+            class_index = int(class_index) if class_index not in (None, "") else None
+        except (TypeError, ValueError):
+            class_index = None
+
+        if (not kssj or not jssj) and class_index in EventParser.TIS_CLASS_TIME_MAP:
+            period_start, period_end = EventParser.TIS_CLASS_TIME_MAP[class_index]
+            if not kssj:
+                kssj = period_start
+            if not jssj:
+                jssj = period_end
 
         def _build_dt(date_s: str, time_s: str) -> Optional[datetime]:
             if not time_s:
@@ -611,31 +639,47 @@ class EventParser:
         dtstart = _build_dt(date_str, kssj) or datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=CST).astimezone(UTC)
         dtend = _build_dt(date_str, jssj)
 
-        title = raw.get("kcmc") or raw.get("rcnr") or "TIS 日程"
-        location = raw.get("cdmc") or raw.get("cdxxmc") or None
-        teacher = raw.get("jsxm") or raw.get("skjs") or None
+        title = _pick("kcmc", "KCMC", "rcnr", "RCNR", default="TIS 日程")
+        location = _pick("cdmc", "CDMC", "cdxxmc", "CDXXMC", "dd", "DD")
+
+        teacher = _pick("jsxm", "JSXM", "skjs", "SKJS")
+        bt_string = str(_pick("bt", "BT", default="") or "")
+        if not teacher and ":" in bt_string:
+            # BT 格式通常为“xxx:教师名...”，截取开头非数字部分作为教师。
+            tail = bt_string.split(":", 1)[1].strip()
+            teacher_chars = []
+            for ch in tail:
+                if ch.isdigit():
+                    break
+                teacher_chars.append(ch)
+            teacher = "".join(teacher_chars).strip() or None
 
         # description
         desc_parts = []
         if holiday_name:
             desc_parts.append(f"Holiday anomaly: {holiday_name}")
-        if raw.get("skjcmc"):
-            desc_parts.append(f"节次: {raw['skjcmc']}")
+        skjcmc = _pick("skjcmc", "SKJCMC")
+        if skjcmc:
+            desc_parts.append(f"节次: {skjcmc}")
+        if class_index is not None:
+            desc_parts.append(f"课程序号: {class_index}")
         if teacher:
             desc_parts.append(f"教师: {teacher}")
+        if bt_string:
+            desc_parts.append(f"课程标题: {bt_string}")
 
         # 类型推断
-        rcflmc = (raw.get("rcflmc") or "").lower()
+        rcflmc = str(_pick("rcflmc", "RCFLMC", default="") or "").lower()
         if "考试" in title or "exam" in title.lower() or "考试" in rcflmc:
             evt_type = EventType.EXAM.value
-        elif "课" in rcflmc or raw.get("kcmc"):
+        elif "课" in rcflmc or _pick("kcmc", "KCMC"):
             evt_type = EventType.CLASS.value
         else:
             evt_type = EventType.OTHER.value
 
-        source_id = raw.get("id") or raw.get("rcid") or f"tis_{date_str}_{kssj}_{title}"
-        course_name = raw.get("kcmc") or None
-        course_id = raw.get("kcid") or raw.get("kcdm") or None
+        source_id = _pick("id", "ID", "rcid", "RCID") or f"tis_{date_str}_{kssj}_{title}"
+        course_name = _pick("kcmc", "KCMC") or None
+        course_id = _pick("kcid", "KCID", "kcdm", "KCDM") or None
 
         cat_parts = [c for c in [evt_type, course_id] if c]
         if holiday_name:

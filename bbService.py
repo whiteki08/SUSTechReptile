@@ -43,15 +43,29 @@ class bbService(CasService):
         headers.update(
             {
                 "Accept": "*/*",
-                "Referer": "https://bb.sustech.edu.cn/webapps/calendar/viewPersonal",
+                "Referer": "https://bb.sustech.edu.cn/webapps/calendar/viewMyBb?globalNavigation=false",
+                "Origin": "https://bb.sustech.edu.cn",
                 "X-Requested-With": "XMLHttpRequest",
             }
         )
         return headers
 
+    def _ensure_calendar_timezone_cookie(self) -> None:
+        """某些 BB 节点依赖该 cookie 决定日历窗口解析。"""
+        if self.session.cookies.get("BbClientCalenderTimeZone"):
+            return
+        self.session.cookies.set(
+            "BbClientCalenderTimeZone",
+            "Asia/Shanghai",
+            domain="bb.sustech.edu.cn",
+            path="/",
+        )
+
     def _warmup_calendar_context(self, headers: dict) -> None:
         """预热日历上下文，降低 selectedCalendarEvents 直接 500 的概率。"""
+        self._ensure_calendar_timezone_cookie()
         warmup_urls = [
+            "https://bb.sustech.edu.cn/webapps/calendar/viewMyBb?globalNavigation=false",
             "https://bb.sustech.edu.cn/webapps/calendar/viewPersonal",
             "https://bb.sustech.edu.cn/webapps/calendar/calendarData/calendars",
         ]
@@ -158,6 +172,7 @@ class bbService(CasService):
         }
 
         try:
+            self._ensure_calendar_timezone_cookie()
             response = self.session.get(url, headers=headers, params=params, timeout=20)
         except requests.RequestException as exc:
             error_payload = {
@@ -329,9 +344,26 @@ class bbService(CasService):
         :param end_date: 查询范围的结束时间 (datetime object)
         :return: 包含日历事件的列表 (list of dicts)，如果失败则返回 None
         """
-        # 将 datetime 对象转换为毫秒级 Unix 时间戳
-        start_ts = int(start_date.timestamp() * 1000)
-        end_ts = int(end_date.timestamp() * 1000)
+        cst = datetime.timezone(datetime.timedelta(hours=8))
+
+        def _normalize_window_start(dt: datetime.datetime) -> datetime.datetime:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=cst)
+            dt = dt.astimezone(cst)
+            return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        start_local = _normalize_window_start(start_date)
+        end_local = _normalize_window_start(end_date)
+        if end_local <= start_local:
+            end_local = start_local + datetime.timedelta(days=1)
+
+        # 将 datetime 对象转换为毫秒级 Unix 时间戳（归一化到上海时区日界线）
+        start_ts = int(start_local.timestamp() * 1000)
+        end_ts = int(end_local.timestamp() * 1000)
+        print(
+            "[bb-debug] normalized query window "
+            f"start_cst={start_local.isoformat()} end_cst={end_local.isoformat()}"
+        )
         headers = self._calendar_request_headers()
 
         self._warmup_calendar_context(headers)
