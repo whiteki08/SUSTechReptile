@@ -317,9 +317,11 @@ class VEvent(SQLModel, table=True):
         def _add_line(line: str) -> None:
             out_lines.extend(_fold_ics_line(line))
 
-        if legacy_bb_style and self.x_source == EventSource.BB.value:
-            bb_summary = _build_bb_summary()
-            bb_description = _build_bb_description()
+        bb_event = self.x_source == EventSource.BB.value
+        bb_summary = _build_bb_summary() if bb_event else (self.summary or "")
+        bb_description = _build_bb_description() if bb_event else self.description
+
+        if legacy_bb_style and bb_event:
 
             _add_line("BEGIN:VEVENT")
             if bb_description:
@@ -340,10 +342,10 @@ class VEvent(SQLModel, table=True):
             _add_line(f"DTEND:{_dt_fmt(self.dtend)}")
         if self.duration:
             _add_line(f"DURATION:{self.duration}")
-        if self.summary:
-            _add_line(f"SUMMARY:{_escape_ics_text(self.summary)}")
-        if self.description:
-            _add_line(f"DESCRIPTION:{_escape_ics_text(self.description)}")
+        if bb_summary:
+            _add_line(f"SUMMARY:{_escape_ics_text(bb_summary)}")
+        if bb_description:
+            _add_line(f"DESCRIPTION:{_escape_ics_text(bb_description)}")
         if self.location:
             _add_line(f"LOCATION:{_escape_ics_text(self.location)}")
         if self.url:
@@ -1386,7 +1388,10 @@ class Scheduler:
         """
         events = self.query_events(start=start, end=end, source=source)
         source_value = (source or "").lower()
-        legacy_bb_style = source_value == EventSource.BB.value
+        events_all_bb = bool(events) and all(
+            e.x_source == EventSource.BB.value for e in events
+        )
+        legacy_bb_style = source_value == EventSource.BB.value or events_all_bb
 
         if legacy_bb_style:
             # Keep bb output concise and human-readable, aligned with legacy format.
