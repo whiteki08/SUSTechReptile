@@ -61,7 +61,93 @@ class bbService(CasService):
             except requests.RequestException as exc:
                 print(f"BB calendar warmup request failed for {url}: {exc}")
 
-    def _request_calendar_window(self, headers: dict, start_ts: int, end_ts: int):
+    def _safe_response_headers(self, response: requests.Response) -> dict:
+        """只记录少量对排障有帮助的响应头，避免噪音过大。"""
+        keys = (
+            "Content-Type",
+            "Server",
+            "Date",
+            "Via",
+            "X-Request-Id",
+            "X-Correlation-Id",
+            "CF-Ray",
+            "Set-Cookie",
+            "Cache-Control",
+            "Retry-After",
+        )
+        result = {}
+        for key in keys:
+            value = response.headers.get(key)
+            if value is None:
+                continue
+            if key.lower() == "set-cookie":
+                # 避免日志泄露具体 cookie 值。
+                value = f"<present:{len(value)} chars>"
+            result[key] = value
+        return result
+
+    def _window_context(self, start_ts: int, end_ts: int) -> dict:
+        start_dt = datetime.datetime.fromtimestamp(start_ts / 1000, tz=datetime.timezone.utc)
+        end_dt = datetime.datetime.fromtimestamp(end_ts / 1000, tz=datetime.timezone.utc)
+        span_days = round((end_ts - start_ts) / (1000 * 60 * 60 * 24), 3)
+        return {
+            "window_start_utc": start_dt.isoformat(),
+            "window_end_utc": end_dt.isoformat(),
+            "window_span_days": span_days,
+        }
+
+    def _log_calendar_failure_context(
+        self,
+        response: requests.Response,
+        *,
+        phase: str,
+        attempt: int,
+        max_attempts: int,
+        start_ts: int,
+        end_ts: int,
+        chunk_label: Optional[str] = None,
+    ) -> None:
+        preview = (response.text or "")[:500].replace("\n", " ").replace("\r", " ").strip()
+        history = [
+            {
+                "status": item.status_code,
+                "url": item.url,
+            }
+            for item in response.history[-5:]
+        ]
+        elapsed_ms = None
+        if getattr(response, "elapsed", None) is not None:
+            elapsed_ms = int(response.elapsed.total_seconds() * 1000)
+
+        debug_payload = {
+            "phase": phase,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "chunk": chunk_label,
+            "status_code": response.status_code,
+            "request_method": getattr(response.request, "method", None),
+            "request_url": getattr(response.request, "url", None),
+            "final_url": response.url,
+            "elapsed_ms": elapsed_ms,
+            "redirect_history": history,
+            "headers": self._safe_response_headers(response),
+            "looks_like_cas_login_page": self._is_probable_cas_login_page(response),
+            "response_preview": preview,
+        }
+        debug_payload.update(self._window_context(start_ts, end_ts))
+        print("[bb-debug] calendar request failure context=" + json.dumps(debug_payload, ensure_ascii=True))
+
+    def _request_calendar_window(
+        self,
+        headers: dict,
+        start_ts: int,
+        end_ts: int,
+        *,
+        phase: str,
+        attempt: int,
+        max_attempts: int,
+        chunk_label: Optional[str] = None,
+    ):
         """请求一个时间窗口内的 Blackboard 日历事件。成功返回 list，失败返回 None。"""
         url = "https://bb.sustech.edu.cn/webapps/calendar/calendarData/selectedCalendarEvents"
         params = {
@@ -74,11 +160,28 @@ class bbService(CasService):
         try:
             response = self.session.get(url, headers=headers, params=params, timeout=20)
         except requests.RequestException as exc:
-            print(f"Query BB calendar request failed: {exc}")
+            error_payload = {
+                "phase": phase,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "chunk": chunk_label,
+                "exception": str(exc),
+            }
+            error_payload.update(self._window_context(start_ts, end_ts))
+            print("[bb-debug] calendar request exception=" + json.dumps(error_payload, ensure_ascii=True))
             return None
 
         if response.status_code != 200:
             print(f"Query BB calendar failed! Status code: {response.status_code}")
+            self._log_calendar_failure_context(
+                response,
+                phase=phase,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                chunk_label=chunk_label,
+            )
             if "Could not initialize class org.springframework.aop.config.AopConfigUtils" in (response.text or ""):
                 print(
                     "BB server-side Spring initialization error detected; retry later or re-login to hit another backend node."
@@ -236,7 +339,14 @@ class bbService(CasService):
         # 第一阶段：整段重试，优先拿到完整区间。
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
-            data = self._request_calendar_window(headers, start_ts, end_ts)
+            data = self._request_calendar_window(
+                headers,
+                start_ts,
+                end_ts,
+                phase="primary",
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
             if data is not None:
                 print(f"Query BB calendar successfully! attempt={attempt}, events={len(data)}")
                 return data
@@ -253,6 +363,7 @@ class bbService(CasService):
         seen_ids = set()
         failed_chunks = 0
         chunk_count = 0
+        failed_chunk_labels = []
 
         cursor = start_date
         while cursor < end_date:
@@ -260,10 +371,21 @@ class bbService(CasService):
             next_cursor = min(cursor + datetime.timedelta(days=chunk_days), end_date)
             chunk_start_ts = int(cursor.timestamp() * 1000)
             chunk_end_ts = int(next_cursor.timestamp() * 1000)
+            chunk_label = (
+                f"{cursor.strftime('%Y-%m-%d')} -> {next_cursor.strftime('%Y-%m-%d')}"
+            )
 
             chunk_data = None
             for chunk_attempt in range(1, 3):
-                chunk_data = self._request_calendar_window(headers, chunk_start_ts, chunk_end_ts)
+                chunk_data = self._request_calendar_window(
+                    headers,
+                    chunk_start_ts,
+                    chunk_end_ts,
+                    phase="chunked",
+                    attempt=chunk_attempt,
+                    max_attempts=2,
+                    chunk_label=chunk_label,
+                )
                 if chunk_data is not None:
                     break
                 if chunk_attempt < 2:
@@ -272,9 +394,10 @@ class bbService(CasService):
 
             if chunk_data is None:
                 failed_chunks += 1
+                failed_chunk_labels.append(chunk_label)
                 print(
                     "Chunk query failed: "
-                    f"{cursor.strftime('%Y-%m-%d')} -> {next_cursor.strftime('%Y-%m-%d')}"
+                    f"{chunk_label}"
                 )
             else:
                 for item in chunk_data:
@@ -300,8 +423,18 @@ class bbService(CasService):
                 "Query BB calendar partially succeeded via chunked fallback. "
                 f"failed_chunks={failed_chunks}/{chunk_count}, events={len(merged_events)}"
             )
+            if failed_chunk_labels:
+                print(
+                    "[bb-debug] failed chunk list: "
+                    + "; ".join(failed_chunk_labels)
+                )
             return merged_events
 
+        if failed_chunk_labels:
+            print(
+                "[bb-debug] failed chunk list: "
+                + "; ".join(failed_chunk_labels)
+            )
         print("Query BB calendar failed after retries and chunked fallback.")
         return None
 
