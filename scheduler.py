@@ -257,23 +257,29 @@ class VEvent(SQLModel, table=True):
 
         def _fold_ics_line(line: str) -> List[str]:
             """Fold a logical line at 75 octets (UTF-8) per RFC 5545 §3.1."""
-            encoded = line.encode("utf-8")
             max_octets = 75
-            if len(encoded) <= max_octets:
+            if len(line.encode("utf-8")) <= max_octets:
                 return [line]
+
             parts: List[str] = []
-            start = 0
-            first = True
-            while start < len(encoded):
-                limit = max_octets if first else max_octets - 1
-                end = min(start + limit, len(encoded))
-                # Step back while pointing at a UTF-8 continuation byte (10xxxxxx)
-                while end > start and (encoded[end - 1] & 0xC0) == 0x80:
-                    end -= 1
-                chunk = encoded[start:end].decode("utf-8", errors="strict")
-                parts.append(chunk if first else " " + chunk)
-                first = False
-                start = end
+            current = ""
+            limit = max_octets
+
+            for ch in line:
+                candidate = current + ch
+                if len(candidate.encode("utf-8")) <= limit:
+                    current = candidate
+                    continue
+
+                # Flush current line and start a continuation line.
+                if current:
+                    parts.append((" " if parts else "") + current)
+                current = ch
+                limit = max_octets - 1
+
+            if current or not parts:
+                parts.append((" " if parts else "") + current)
+
             return parts
 
         out_lines: List[str] = []
@@ -640,7 +646,7 @@ class EventParser:
         dtend = _build_dt(date_str, jssj)
 
         title = _pick("kcmc", "KCMC", "rcnr", "RCNR", default="TIS 日程")
-        location = _pick("cdmc", "CDMC", "cdxxmc", "CDXXMC", "dd", "DD")
+        location = _pick("nr", "NR", "cdmc", "CDMC", "cdxxmc", "CDXXMC", "dd", "DD")
 
         teacher = _pick("jsxm", "JSXM", "skjs", "SKJS")
         bt_string = str(_pick("bt", "BT", default="") or "")
