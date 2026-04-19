@@ -114,7 +114,7 @@ ICAL_TOKEN = os.environ.get("ICAL_TOKEN")
 CRON_TOKEN = os.environ.get("CRON_TOKEN")  # Cron Job 的安全令牌
 CRON_SECRET = os.environ.get("CRON_SECRET")  # Vercel Cron Bearer 令牌
 HOLIDAY_API_TEMPLATE = os.environ.get(
-    "HOLIDAY_API_TEMPLATE", "https://date.nager.at/api/v3/PublicHolidays/{year}/CN"
+    "HOLIDAY_API_TEMPLATE", "https://api.jiejiariapi.com/v1/holidays/{year}"
 )
 HOLIDAY_API_TIMEOUT_SECONDS = max(
     1.0, float(os.environ.get("HOLIDAY_API_TIMEOUT_SECONDS", "8"))

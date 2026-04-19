@@ -5,7 +5,7 @@ from threading import Lock
 
 import requests
 
-DEFAULT_API_TEMPLATE = "https://date.nager.at/api/v3/PublicHolidays/{year}/CN"
+DEFAULT_API_TEMPLATE = "https://api.jiejiariapi.com/v1/holidays/{year}"
 
 # Keep a tiny static fallback for well-known national holidays.
 STATIC_CN_HOLIDAYS: dict[int, dict[str, str]] = {
@@ -36,7 +36,7 @@ def _normalize_day(value: date | datetime | str) -> date:
 
 
 class HolidayProvider:
-    """Holiday lookup backed by Nager public holiday API with in-memory cache."""
+    """Holiday lookup backed by public holiday APIs with in-memory cache."""
 
     def __init__(
         self,
@@ -86,17 +86,41 @@ class HolidayProvider:
         except (requests.RequestException, ValueError):
             return None
 
-        if not isinstance(payload, list):
-            return None
-
         holidays: dict[str, str] = {}
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            day = item.get("date")
-            if not isinstance(day, str):
-                continue
-            holiday_name = item.get("localName") or item.get("name") or "Holiday"
-            holidays[day] = str(holiday_name)
 
-        return holidays or None
+        # Preferred API shape (jiejiariapi):
+        # {
+        #   "2026-01-01": {"date": "2026-01-01", "name": "元旦", "isOffDay": true},
+        #   ...
+        # }
+        if isinstance(payload, dict):
+            for key, item in payload.items():
+                if not isinstance(item, dict):
+                    continue
+                day = item.get("date") if isinstance(item.get("date"), str) else key
+                if not isinstance(day, str):
+                    continue
+
+                # 只把法定休息日/调休日当作 holiday。
+                is_off_day = item.get("isOffDay")
+                if isinstance(is_off_day, bool) and not is_off_day:
+                    continue
+
+                holiday_name = item.get("name") or item.get("localName") or item.get("holiday") or "Holiday"
+                holidays[day] = str(holiday_name)
+
+            return holidays or None
+
+        # Backward compatibility for list-based APIs (e.g. Nager).
+        if isinstance(payload, list):
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                day = item.get("date")
+                if not isinstance(day, str):
+                    continue
+                holiday_name = item.get("localName") or item.get("name") or "Holiday"
+                holidays[day] = str(holiday_name)
+            return holidays or None
+
+        return None
