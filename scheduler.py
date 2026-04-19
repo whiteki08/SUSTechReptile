@@ -328,6 +328,7 @@ class VEvent(SQLModel, table=True):
                 _add_line(f"DESCRIPTION:{_escape_ics_text(bb_description)}")
             if self.dtend:
                 _add_line(f"DTEND:{_dt_fmt(self.dtend)}")
+            _add_line(f"DTSTAMP:{_dt_fmt(self.dtstamp)}")
             _add_line(f"DTSTART:{_dt_fmt(self.dtstart)}")
             _add_line(f"SUMMARY:{_escape_ics_text(bb_summary)}")
             _add_line(f"UID:{self.uid}")
