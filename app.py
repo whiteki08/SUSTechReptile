@@ -106,6 +106,40 @@ def _sanitize_location_prefix(prefix: str | None) -> str:
     return cleaned
 
 
+def _normalize_tis_location(raw_location: str | None, location_prefix: str | None = None) -> str | None:
+    """标准化 TIS 地点字段，确保 KV/DB 导出一致。"""
+    if raw_location is None:
+        return None
+
+    raw_text = str(raw_location).strip()
+    if not raw_text:
+        return None
+
+    prefix = _sanitize_location_prefix(location_prefix)
+    core = raw_text
+    if prefix and core.startswith(prefix):
+        core = core[len(prefix):].strip()
+
+    alias_prefixes = (
+        ("一教", "第一教学楼"),
+        ("二教", "第二教学楼"),
+        ("三教", "第三教学楼"),
+    )
+    for short, full in alias_prefixes:
+        if core.startswith(short):
+            core = f"{full}{core[len(short):]}"
+            break
+
+    if core.startswith("智华教学楼楼"):
+        core = core.replace("智华教学楼楼", "智华教学楼", 1)
+    elif core.startswith("智华楼"):
+        core = core.replace("智华楼", "智华教学楼", 1)
+    elif core.startswith("智华"):
+        core = core.replace("智华", "智华教学楼", 1)
+
+    return f"{prefix}{core}" if prefix else core
+
+
 # --- 配置 ---
 # 这些将从 Vercel 的环境变量中读取
 SUSTECH_SID = os.environ.get("SUSTECH_SID")
@@ -354,23 +388,11 @@ def convert_tis_json_to_ical(schedule_json, holiday_provider=None):
 
             e.begin = SHANGHAI_TZ.localize(naive_begin)
             e.end = SHANGHAI_TZ.localize(naive_end)
-            location_str = item.get("NR") or item.get("nr")
+            location_raw = item.get("NR") or item.get("nr")
+            location_str = _normalize_tis_location(location_raw, location_prefix)
             if location_str:
-                replace_dict = {
-                    "一教": "第一教学楼",
-                    "二教": "第二教学楼",
-                    "三教": "第三教学楼",
-                    "智华": "智华教学楼",
-                }
-                for short, full in replace_dict.items():
-                    if short in location_str:
-                        location_str = location_str.replace(short, full)
-                        break
-                e.location = (
-                    f"{location_prefix}{location_str}"
-                    if location_prefix
-                    else location_str
-                )
+                e.location = location_str
+                print(f"[location] raw='{location_raw or ''}' cleaned='{e.location}'")
             teacher_name = "N/A"
             bt_string = item.get("BT", "") or item.get("bt", "")
             if ":" in bt_string:

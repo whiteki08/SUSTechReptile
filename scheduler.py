@@ -44,6 +44,12 @@ logger = logging.getLogger(__name__)
 UTC = timezone.utc
 CST = timezone(timedelta(hours=8))  # China Standard Time, UTC+8
 
+_TIS_LOCATION_ALIAS_PREFIXES = (
+    ("一教", "第一教学楼"),
+    ("二教", "第二教学楼"),
+    ("三教", "第三教学楼"),
+)
+
 
 def _now_utc() -> datetime:
     return datetime.now(tz=UTC)
@@ -77,6 +83,48 @@ def _cst_str(iso_utc: Optional[str]) -> str:
     if dt is None:
         return iso_utc or ""
     return dt.astimezone(CST).strftime("%Y-%m-%d %H:%M:%S CST")
+
+
+def _sanitize_location_prefix(prefix: Optional[str]) -> str:
+    if not prefix:
+        return ""
+    return prefix.strip().strip('"').strip("'").strip()
+
+
+def _normalize_tis_location(
+    raw_location: Optional[str],
+    location_prefix: Optional[str] = None,
+) -> Optional[str]:
+    """标准化 TIS 地点字段，确保 DB/KV 链路输出一致。"""
+    if raw_location is None:
+        return None
+
+    raw_text = str(raw_location).strip()
+    if not raw_text:
+        return None
+
+    prefix = _sanitize_location_prefix(
+        location_prefix if location_prefix is not None else os.getenv("LOCATION_PREFIX")
+    )
+
+    core = raw_text
+    if prefix and core.startswith(prefix):
+        core = core[len(prefix):].strip()
+
+    for short, full in _TIS_LOCATION_ALIAS_PREFIXES:
+        if core.startswith(short):
+            core = f"{full}{core[len(short):]}"
+            break
+
+    # 防止“智华楼”映射后出现“智华教学楼楼xxx”
+    if core.startswith("智华教学楼楼"):
+        core = core.replace("智华教学楼楼", "智华教学楼", 1)
+    elif core.startswith("智华楼"):
+        core = core.replace("智华楼", "智华教学楼", 1)
+    elif core.startswith("智华"):
+        core = core.replace("智华", "智华教学楼", 1)
+
+    return f"{prefix}{core}" if prefix else core
 
 
 # ========================== 枚举 ==========================
@@ -255,6 +303,21 @@ class VEvent(SQLModel, table=True):
             value = value.replace("\n", r"\n")
             return value
 
+        def _format_categories(raw_categories: str) -> str:
+            """Serialize CATEGORIES as comma-separated list values per RFC 5545."""
+            parts = [p.strip() for p in raw_categories.split(",") if p and p.strip()]
+            if not parts:
+                return _escape_ics_text(raw_categories)
+
+            def _escape_category(value: str) -> str:
+                value = value.replace("\r\n", "\n").replace("\r", "")
+                value = value.replace("\\", "\\\\")
+                value = value.replace(";", r"\;")
+                value = value.replace("\n", r"\n")
+                return value
+
+            return ",".join(_escape_category(part) for part in parts)
+
         def _fold_ics_line(line: str) -> List[str]:
             """Fold a logical line at 75 octets (UTF-8) per RFC 5545 §3.1."""
             max_octets = 75
@@ -354,9 +417,25 @@ class VEvent(SQLModel, table=True):
         if self.status:
             _add_line(f"STATUS:{self.status}")
         if self.categories:
-            _add_line(f"CATEGORIES:{_escape_ics_text(self.categories)}")
+            _add_line(f"CATEGORIES:{_format_categories(self.categories)}")
         if self.rrule:
             _add_line(f"RRULE:{self.rrule}")
+        if self.exdate:
+            exdate_values = []
+            for raw_exdate in self.exdate.split(","):
+                dt = _parse_iso(raw_exdate.strip())
+                if dt is not None:
+                    exdate_values.append(_dt_fmt(dt))
+            if exdate_values:
+                _add_line(f"EXDATE:{','.join(exdate_values)}")
+        if self.recurrence_id:
+            recurrence_dt = _parse_iso(self.recurrence_id)
+            if recurrence_dt is not None:
+                _add_line(f"RECURRENCE-ID:{_dt_fmt(recurrence_dt)}")
+            else:
+                _add_line(f"RECURRENCE-ID:{_escape_ics_text(self.recurrence_id)}")
+        if self.geo:
+            _add_line(f"GEO:{self.geo}")
         _add_line(f"SEQUENCE:{self.sequence}")
         _add_line(f"CREATED:{_dt_fmt(self.created)}")
         _add_line(f"LAST-MODIFIED:{_dt_fmt(self.last_modified)}")
@@ -694,7 +773,8 @@ class EventParser:
         dtend = _build_dt(date_str, jssj)
 
         title = _pick("kcmc", "KCMC", "rcnr", "RCNR", default="TIS 日程")
-        location = _pick("nr", "NR", "cdmc", "CDMC", "cdxxmc", "CDXXMC", "dd", "DD")
+        raw_location = _pick("nr", "NR", "cdmc", "CDMC", "cdxxmc", "CDXXMC", "dd", "DD")
+        location = _normalize_tis_location(raw_location)
 
         teacher = _pick("jsxm", "JSXM", "skjs", "SKJS")
         bt_string = str(_pick("bt", "BT", default="") or "")
@@ -781,13 +861,14 @@ class EventParser:
             if not isinstance(items, list):
                 continue
 
-            holiday_name = None
-            if holiday_provider is not None and holiday_provider.is_holiday(date_str):
-                holiday_name = holiday_provider.holiday_name(date_str) or "Holiday"
-
             for item in items:
                 try:
-                    event = cls.parse_tis_event(item, date_str, holiday_name=holiday_name)
+                    event_date = str(item.get("SJ") or item.get("sj") or date_str)
+                    holiday_name = None
+                    if holiday_provider is not None and holiday_provider.is_holiday(event_date):
+                        holiday_name = holiday_provider.holiday_name(event_date) or "Holiday"
+
+                    event = cls.parse_tis_event(item, event_date, holiday_name=holiday_name)
                     if event.status == ICSStatus.CANCELLED.value and event.x_event_type == EventType.HOLIDAY_ANOMALY.value:
                         stats["holiday_cancelled"] += 1
                     events.append(event)
